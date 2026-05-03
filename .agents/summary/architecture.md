@@ -58,7 +58,7 @@ graph TB
 ```mermaid
 graph TB
     Server[struct valkeyServer<br/>src/server.h]
-    Server --> DBs[redisDb[] — array of databases]
+    Server --> DBs[redisDb — array of databases]
     DBs --> KV[kvstore<br/>src/kvstore.c]
     KV --> HT[hashtable<br/>src/hashtable.c]
     HT --> ROBJ[robj<br/>src/object.c]
