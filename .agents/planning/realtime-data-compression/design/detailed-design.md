@@ -28,7 +28,9 @@ _Source issue: [valkey-io/valkey #3423](https://github.com/valkey-io/valkey/issu
 
 Valkey keeps values in memory as SDS strings. For workloads dominated by `OBJ_STRING` values of moderate size (256 B – 1 MiB) with repetitive content (JSON blobs, URL-keyed DTOs, HTML fragments, serialized protocol buffers, etc.), a large fraction of the memory footprint is compressible. Internal fleet analysis on AWS ElastiCache shows ≥50% memory savings are achievable on 92% of memory-bound production snapshots using ZSTD with a trained dictionary.
 
-This feature adds **opt-in, transparent, server-side, in-memory compression** for `OBJ_STRING` values. Compressed values are automatically decompressed on any read path (client commands, scripts, transactions, replication, AOF, modules), so no client or operational tooling changes are required. The feature is disabled by default; enabled, it is fully observable via `INFO`, controllable via `CONFIG SET compression-*` and a new `COMPRESSION` subcommand container, and bounded in both CPU and memory overhead.
+This feature adds **opt-in, transparent, server-side, in-memory compression** for `OBJ_STRING` values. Compressed values are automatically decompressed on every **client-facing read path** (client commands, scripts, transactions, the replication feed, AOF writer, module API), so no client or operational tooling changes are required. The feature is disabled by default; enabled, it is fully observable via `INFO`, controllable via `CONFIG SET compression-*` and a new `COMPRESSION` subcommand container, and bounded in both CPU and memory overhead.
+
+Note: the **on-disk RDB file may contain compressed values** (to preserve the memory win across restarts and shrink snapshot size/save time). This is the one intentional exception to "decompressed at every boundary" — it is an internal persistence format, not a client-facing read path. See §2.6 for the full persistence-boundary specification; full-sync replication RDB streams are always uncompressed per R2.6.8.
 
 ### 1.2 Headline scope statement
 
@@ -57,9 +59,9 @@ Requirements are consolidated from `idea-honing.md`. Each bullet is traceable to
 
 - **R2.1.1** The feature is gated by a master switch `compression-enabled` (bool, default `no`, `MODIFIABLE_CONFIG`). When `no`, no compression CPU is spent and no worker threads run. (Q5)
 - **R2.1.2** Two surfaces toggle the switch: `CONFIG SET compression-enabled yes|no` (primary) and `COMPRESSION ENABLE`/`COMPRESSION DISABLE` (convenience alias, writes a `LL_NOTICE` log entry for audit trails). (Q5)
-- **R2.1.3** `no → yes` transition: background sweeper starts on the next cron tick; values are compressed opportunistically by new writes and by the sweeper. `COMPRESSION SWEEP` triggers immediate sweep. (Q5)
-- **R2.1.4** `yes → no` transition: new writes stop being compressed; existing compressed values continue to be decompressed on read; the dictionary registry stays alive. No automatic keyspace decompress. Operator explicitly runs `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and the dictionary registry. Peak memory is never doubled automatically. (Q5)
-- **R2.1.5** A third state — "`compression-enabled yes` but no active dictionary yet" — behaves identically to disabled for new writes. Decompression of any existing frames still works. Documented as expected behavior. (Q5)
+- **R2.1.3** `no → yes` transition: background sweeper starts on the next cron tick; values are compressed opportunistically by new writes and by the sweeper. `COMPRESSION SWEEP` triggers immediate sweep. **Operators who want to enable without auto-sweeping existing data** can achieve this without any new config: set `compression-threads 0` before the toggle (worker pool disabled, candidates queue but no work happens), flip the master switch, then raise `compression-threads` to 1+ when ready to drain the queue. This is the symmetric counterpart to the `yes → no` default in R2.1.4. (Q5)
+- **R2.1.4** `yes → no` transition: new writes stop being compressed; existing compressed values continue to be decompressed **on read only** (cold/untouched keys remain compressed indefinitely); the dictionary registry stays alive. No automatic full-keyspace decompress. Operator explicitly runs `COMPRESSION SWEEP direction=decompress` to decompress all keys in the background — this **guarantees eventual full coverage** regardless of read activity, and eventually drains the compressed-frame population so the dictionary registry can retire. Peak memory during an explicit sweep grows proportionally to the uncompressed dataset size (factor `1/compression_ratio` vs. the compressed baseline — e.g. ~2–3× for typical ratios of 0.3–0.5), but growth is bounded by `compression-sweep-max-cpu-pct` pacing — never a synchronous spike. (Q5)
+- **R2.1.5** A third state — "`compression-enabled yes` but no active dictionary for new writes" — behaves identically to disabled for writes. Decompression of any existing compressed frames continues to work: **refcount-based dictionary retirement (R2.3.4) and the safety check in `COMPRESSION DICT DROP` (§4.5) together guarantee that a dict cannot be freed while any frame references it.** A "retiring" dict stays in the registry and services decompressions until its last referencing frame is rewritten, overwritten, expired, or explicitly decompressed. The state *"no dicts in registry AND compressed frames exist"* is by-construction unreachable. Documented as expected behavior. (Q5)
 
 ### 2.2 Value eligibility
 
@@ -68,16 +70,14 @@ The compression sweeper considers a value eligible iff the predicate holds:
 ```
 eligible(obj) ⇔
     obj->type == OBJ_STRING
- && obj->encoding ∈ {RAW, EMBSTR}
+ && obj->encoding == RAW
  && obj->refcount != OBJ_SHARED_REFCOUNT
  && sdslen(val) >= compression-min-value-size
  && (compression-max-value-size == 0 || sdslen(val) <= compression-max-value-size)
- && last_retry_failure_age(obj) >= compression-retry-interval
- && (
-        (lfu_mode  && lfu_freq(obj)   <  compression-lfu-threshold)   ||
-        (lru_mode  && lru_idle(obj)   >= compression-lru-idle-seconds) ||
-        (other     && write_age(obj)  >= compression-settle-seconds)
-    )
+ && retry_eligible(obj)                                       // dict-ID scoped; see R2.4 post-compression guard
+ && write_age(obj)       >= compression-settle-seconds        // always applied
+ && idle_seconds(obj)    >= compression-min-idle-seconds      // always applied (works under LRU, LFU, noeviction)
+ && (!lfu_mode || lfu_freq(obj) < compression-lfu-threshold)  // LFU additional guard, only when LFU is active
 ```
 (Q6, Q7)
 
@@ -101,7 +101,7 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
   - **Drift-based steady-state retraining**: fires when `compression_live_ratio_10m < compression-dict-drift-ratio × post_training_ratio` (default drift ratio `70%`).
   - **Optional time-based retraining**: `compression-dict-refresh-interval` (default `0` = disabled).
   - **Manual**: `COMPRESSION TRAIN` forces an immediate training job.
-- **R2.3.6** **Training sampling**: the training job walks kvstore shards in random order on a `bio` worker, collects sample pointers into value sds bodies via `incrRefCount`, passes them directly to `ZDICT_trainFromBuffer`, and `decrRefCount`s after training. No reservoir buffer; zero sustained memory overhead. Scan uses `LOOKUP_NOTOUCH` semantics — training reads do not update LRU/LFU. (Q9)
+- **R2.3.6** **Training sampling — main-thread iteration, bio-thread training, no sustained reservoir.** The main thread walks `kvstore` shards in random order (reusing the active-expiry / defrag incremental-iteration pattern, spliced across `serverCron` ticks), selects eligible samples, and **copies sample bytes into a pre-allocated contiguous training buffer** with a parallel `sizes[]` array. When `compression-dict-first-training-keys-count` samples are collected, the main thread submits `(buffer, sizes[], count)` as a `BIO_COMPRESSION_TRAIN` job. Iteration and any `kvstore` / `refcount` manipulation stay on the main thread; bio never touches `robj`, `kvstore`, or refcounts (consistent with R2.11.4). Scan uses `LOOKUP_NOTOUCH` semantics — training reads do not update LRU/LFU. The training buffer is transient (~10–16 MiB for default settings, freed once bio returns), not a long-lived reservoir. Iteration window is bounded to ~1 s for default settings (hz=10, ~1000 keys/tick) — ≪ the dict's post-training active lifetime, so spread-in-time sampling does not meaningfully affect dictionary quality; each collected sample is an immutable snapshot of real bytes at copy time, and drift-retraining (R2.3.5) is the backstop for post-training workload shifts. Low-keyspace edge case: if fewer than `first-training-keys-count` eligible values exist, training aborts with a logged warning and retries on the next trigger. (Q9)
 - **R2.3.7** **Training location**: a new `bio` job type `BIO_COMPRESSION_TRAIN`. Fits the `bio` model (long-running, infrequent, one-at-a-time). Does not occupy a compression worker. (Q9)
 - **R2.3.8** **Training algorithm**: `ZDICT_trainFromBuffer` with target size `compression-dict-size` (default `102400` bytes). Advanced tuning is v2. (Q9)
 - **R2.3.9** **Promotion**: after training, the main thread creates `ZSTD_CDict` and `ZSTD_DDict` from the new bytes, inserts into the registry with a fresh dictID, atomically swaps the `active` pointer, and transitions the previous active to `retiring`. (Q1, Q9)
@@ -117,6 +117,15 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
   - Mutates `robj->val_ptr` to the new buffer, sets `encoding = OBJ_ENCODING_COMPRESSED`.
   - Increments the dictID refcount.
   - Does **not** call `signalModifiedKey`. Background compression is a storage change, not a logical value change. (Q11)
+- **R2.4.4** **Immutable-snapshot invariant.** A compression worker reads `src` bytes concurrently with the main thread. Correctness requires that those bytes are **not mutated in place** while the worker runs. v1 relies on Valkey's existing copy-on-write discipline: every command that mutates an existing `OBJ_STRING` value MUST funnel through `dbUnshareStringValue()` (or an equivalent refcount check) **before** modifying `val->ptr`. When a compression job is queued, the main thread holds `incrRefCount(val)`, forcing `refcount >= 2`; the next mutating command sees the bumped refcount and creates a COW copy via `dbUnshareStringValue`, leaving the original bytes immutable for the worker. The rule: **if refcount > 1, thou shalt not mutate in place** — this is a pre-existing Valkey invariant; compression only depends on it, does not introduce it.
+- **R2.4.5** **Invariant-enforcement audit (v1 sign-off checklist).** The `dbUnshareStringValue`-before-mutate discipline is code-discipline, not enforced by the type system, so the design commits to auditing every mutating string code path before v1 merges. Required sites:
+  - `src/t_string.c` — `appendCommand`, `setrangeCommand`, `getsetCommand`, `getdelCommand`, `setCommand` (overwrite path), and any command that writes to an existing value's sds.
+  - `src/bitops.c` — `setbitCommand`, `bitopCommand` (write targets), `bitfieldCommand` (write-intent operations), `bitcountCommand` is read-only so OK.
+  - `src/module.c` — `VM_StringDMA` with `REDISMODULE_WRITE` intent path; `VM_StringAppendBuffer`; `VM_StringTruncate`. All MUST call `dbUnshareStringValue` (or perform the equivalent refcount-guarded COW) on the underlying `robj` before returning the mutable buffer.
+  - `src/debug.c` — any `DEBUG` subcommand that mutates string values.
+  - **New code paths introduced by this feature** — ensure none bypass the discipline.
+  - The audit is tracked as a merge-blocker test (see §7.2 `tests/unit/compression-cow-invariant.tcl`). Any newly discovered violator either calls `dbUnshareStringValue` or is documented in `src/t_string.c` header as a reason to skip compression for its key (add to the eligibility filter). (Q4-review feedback)
+- **R2.4.6** **Fallback path if the invariant fails.** If the post-compression net-savings guard passes but the worker's output doesn't round-trip to the *current* value (main thread decompresses the result and memcmps against live bytes as a cheap sanity check in debug builds), the result is discarded, `compression_errors_total` increments, and a `LL_WARNING` log entry identifies the command that ran during the window. This is a belt-and-suspenders guard; in a correct implementation it fires zero times. The check is gated behind `#ifdef DEBUG_COMPRESSION_SNAPSHOT` so it has no prod cost.
 
 ### 2.5 Decompression path
 
@@ -125,8 +134,8 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
   - If `o->encoding != OBJ_ENCODING_COMPRESSED`: returns `o` unchanged. Zero cost.
   - Otherwise: looks up the dictID in the registry, calls `ZSTD_decompress_usingDDict` into the caller-provided scratch sds, and returns a temporary view `robj` (or equivalent) pointing at the scratch buffer.
 - **R2.5.3** The helper **must not** call `signalModifiedKey`. (Q11)
-- **R2.5.4** `compression-max-value-size` (default `1048576` bytes = 1 MiB, `0` = no bound) excludes pathologically large values from compression so their decompression cost can never stall the main thread. (Q7)
-- **R2.5.5** Large-value workloads that need non-blocking reads are directed to either (a) raise `compression-min-value-size` or lower `compression-max-value-size` to opt them out, or (b) wait for v2 async decompression. (Q7)
+- **R2.5.4** `compression-max-value-size` (default `131072` bytes = 128 KiB, `0` = no bound) excludes values large enough that their main-thread decompression cost is not worth the memory win, keeping per-read decompression latency within the event-loop budget. (Q7)
+- **R2.5.5** **Per-read decompression cost is proportional to value size** (~1 µs/KB at ZSTD level 3 with dictionary). **Multi-key commands pay the sum of per-value costs**, with no per-command cap — by design: a per-command cap would either break transparency (error mid-command) or defeat its own purpose (block). v1 is tuned for the small/moderate-value sweet spot (256 B – 8 KB). Workloads that routinely read many compressed values per command (wide `MGET`, long `SORT`, scripts touching many keys, heavy pipelines over large values) should benchmark before enabling; their remedies are (a) raise `compression-min-value-size` or lower `compression-max-value-size` to exclude the large values, or (b) wait for v2 async decompression. (Q7)
 
 ### 2.6 Persistence
 
@@ -135,12 +144,13 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
   - Layout per compressed value: `[RDB_ENCVAL | dictID (len-encoded) | compressed_len (len-encoded) | uncompressed_len (len-encoded) | ZSTD frame bytes]`.
   - Dictionary bytes are written as `RDB_OPCODE_AUX` entries (key `"compression-dict-<N>"`, value = raw bytes) **before** any compressed value that references them.
   - `RDB_VERSION` is bumped (`80 → 81`). Pre-feature loaders will refuse the file cleanly.
-- **R2.6.2** **RDB load when `compression-enabled yes`**: loader rebuilds CDict/DDict from AUX entries, inserts them into the registry, decompresses values on the fly only if needed (frames reference their dictID so they stay compressed in memory). (Q3, Q12)
-- **R2.6.3** **RDB load when `compression-enabled no`**: loader rebuilds only the DDicts needed, decompresses every `RDB_ENC_ZSTDDICT`-marked value inline, stores uncompressed, discards DDicts after load. (Q3)
+- **R2.6.2** **RDB load when `compression-enabled yes`**: loader reads the dictionary bytes from AUX entries and uses them to construct `ZSTD_CDict`/`ZSTD_DDict` handles (via `ZSTD_createCDict`/`ZSTD_createDDict`; no retraining), inserts them into the registry, decompresses values on the fly only if needed (frames reference their dictID so they stay compressed in memory). (Q3, Q12)
+- **R2.6.3** **RDB load when `compression-enabled no`**: loader reads the dictionary bytes from AUX entries and constructs only the `ZSTD_DDict` handles needed (no retraining), decompresses every `RDB_ENC_ZSTDDICT`-marked value inline, stores uncompressed, discards DDicts after load. (Q3)
 - **R2.6.4** **Missing dictionary**: if a compressed value references a dictID for which no AUX entry was emitted, the RDB is rejected as corrupt regardless of the `compression-enabled` setting. (Q3)
 - **R2.6.5** **AOF**: always uncompressed RESP. Writer routes every `robj` through `objectGetUncompressedView` before emitting. (Q12)
 - **R2.6.6** **Replication feed**: always uncompressed RESP. `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. Cross-version replication unaffected. (Q12)
 - **R2.6.7** **`DUMP` / `RESTORE` / `MIGRATE`**: v1 decompresses before emitting the RDB chunk. Compressed-in-place migration is v2. (Q12)
+- **R2.6.8** **Full-sync replication RDB** (primary → replica during `SYNC`/`PSYNC` full resync): emitted **uncompressed** regardless of `compression-enabled` state on the primary. When the RDB writer is invoked with a replication sink, every compressed value is routed through `objectGetUncompressedView` before serialization — same helper used by `feedReplicationBufferWithObject`. Disk RDB (local save / `BGSAVE` target) continues to use the `RDB_ENC_ZSTDDICT` path from R2.6.1. This keeps cross-version replication working without replica-side awareness and preserves the "wire stays uncompressed RESP/RDB, disk may be compressed" property. Opt-in compressed full-sync (via `REPLCONF` negotiation) is a v2 extension point. (Q12)
 
 ### 2.7 Introspection surfaces
 
@@ -149,7 +159,7 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 - **R2.7.3** **`MEMORY USAGE key`** returns compressed footprint (frame + header + `robj` overhead). Matches what eviction and `maxmemory` actually see. (Q13, Q14)
 - **R2.7.4** **`TYPE`**, **`OBJECT FREQ`**, **`OBJECT IDLETIME`**: unchanged. (Q13)
 - **R2.7.5** **Module API** (`ValkeyModule_StringDMA` read intent, `ValkeyModule_OpenKey`): decompresses transparently via `objectGetUncompressedView`. Existing modules need no changes. (Q13)
-- **R2.7.6** **Module API** (`ValkeyModule_StringDMA` write intent on a compressed value): decompresses in place first (mutates `robj` to `raw`/`embstr`, frees the compressed frame), then returns the sds pointer. The value becomes eligible for re-compression on the next sweep tick. (Q13)
+- **R2.7.6** **Module API** (`ValkeyModule_StringDMA` write intent on a compressed value): decompresses in place first (mutates `robj` to `raw`, frees the compressed frame), then returns the sds pointer. The value becomes eligible for re-compression on the next sweep tick. (Q13)
 
 ### 2.8 Memory accounting
 
@@ -178,22 +188,34 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 
 ### 2.12 Configuration summary
 
-All configs below are `MODIFIABLE_CONFIG` and persist via `CONFIG REWRITE`.
+All configs below are `MODIFIABLE_CONFIG` and persist via `CONFIG REWRITE`. Configs are split into two tiers:
+
+- **Primary** — every operator enabling the feature should review and set these consciously. Documented prominently in `valkey.conf` under a `# Compression` section.
+- **Advanced** — defaults are tuned for the common workload (see §2.5 and §2.9 rationales). Touch only for specific tuning; `valkey.conf` groups these below a clearly-labeled `# Compression — advanced tuning` divider so operators aren't required to reason about them.
+
+All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is documentation-only, not a hiding mechanism.
+
+#### Primary knobs (5)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
 | `compression-enabled` | bool | `no` | master switch |
 | `compression-threads` | int | `1` | worker pool size (0..16; 0 = disabled) |
+| `compression-min-value-size` | bytes | `256` | lower size bound for eligibility |
+| `compression-max-value-size` | bytes | `131072` | upper size bound (0 = unbounded; default 128 KiB bounds worst-case sync decompression latency) |
+| `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
+
+#### Advanced knobs (11)
+
+| Name | Type | Default | Scope |
+|---|---|---|---|
 | `compression-sweep-max-cpu-pct` | int | `25` | sweep pacing (1..100) |
 | `compression_cpulist` | string | `""` | CPU pinning |
-| `compression-min-value-size` | bytes | `256` | lower size bound for eligibility |
-| `compression-max-value-size` | bytes | `1048576` | upper size bound (0 = unbounded) |
 | `compression-min-savings-ratio` | percent | `10` | post-compression net-savings guard |
-| `compression-retry-interval` | seconds | `3600` | cooldown for incompressible keys |
-| `compression-lfu-threshold` | int | `5` | LFU skip-hot-key threshold |
-| `compression-lru-idle-seconds` | seconds | `60` | LRU skip-fresh-key threshold |
-| `compression-settle-seconds` | seconds | `60` | write-age threshold (noeviction/other) |
-| `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
+| `compression-retry-interval` | seconds | `3600` | fallback retry period for the dict-scoped incompressible-keys guard (primary retry signal is active-dict change; this interval catches content changes that alter compressibility while the dict stays stable — see R2.4 / Q6b) |
+| `compression-lfu-threshold` | int | `5` | LFU skip-hot-key additional guard (only active in LFU eviction mode) |
+| `compression-min-idle-seconds` | seconds | `60` | universal read-hotness skip (always applied; reads `robj->lru` via `estimateObjectIdleTime()`) |
+| `compression-settle-seconds` | seconds | `60` | universal write-recency skip (always applied) |
 | `compression-dict-first-training-keys-count` | int | `10000` | first-training trigger |
 | `compression-dict-drift-ratio` | percent | `70` | retrain drift trigger |
 | `compression-dict-refresh-interval` | seconds | `0` | optional periodic retrain (0 = disabled) |
@@ -426,9 +448,9 @@ typedef struct compressionJob {
 ```
 
 **Concurrency notes**:
-- Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker.
+- Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker **and** the object has `refcount >= 2`, which forces any subsequent mutating command to COW instead of mutating in place (Valkey's `dbUnshareStringValue` discipline — see R2.4.4 and R2.4.5 for the invariant and its enforcement).
 - On the outbox side, the main thread re-fetches the current `robj` for the key; if it has changed (version counter moved), the compressed result is discarded.
-- `decrRefCount(val)` is called after the outbox handler finishes.
+- `decrRefCount(val)` is called after the outbox handler finishes. This drops the refcount back to 1 and restores in-place-mutate eligibility for future commands.
 
 ---
 
@@ -575,7 +597,7 @@ See §4.6 `compressionJob`.
 
 ### 6.6 Net-savings guard failure
 
-- Post-compression check determines the compressed form is not worth keeping: discard the compressed buffer, leave the value as-is, stamp the key with `retry_after = now + compression-retry-interval`, increment `compression_skipped_incompressible`. Not an error — normal operation for incompressible data.
+- Post-compression check determines the compressed form is not worth keeping: discard the compressed buffer, leave the value as-is, record `(key, failed_dict_id=active_dict_id, timestamp=now)` in the `incompressibleKeys` side hashtable, increment `compression_skipped_incompressible`. Entry is cleared on successful compression (new dict promoted → retry succeeds) or on `DEL`. Not an error — normal operation for incompressible data. Retry-eligibility is `entry.failed_dict_id != active_dict_id OR age(entry.timestamp) >= compression-retry-interval`.
 
 ### 6.7 Worker thread crash
 
@@ -596,7 +618,7 @@ A new `--compression` flag on each Tcl test driver starts the server under test 
 --compression-min-value-size 0
 --compression-max-value-size 0            # no upper bound
 --compression-lfu-threshold 255
---compression-lru-idle-seconds 0
+--compression-min-idle-seconds 0
 --compression-settle-seconds 0
 --compression-min-savings-ratio 0
 --compression-retry-interval 0
@@ -620,6 +642,7 @@ Deliverables:
 - `tests/unit/compression.tcl` — core feature (toggle, sweep, eligibility, size bounds, post-compression guard, retry cooldown, per-key introspection).
 - `tests/unit/compression-dict.tcl` — `COMPRESSION TRAIN`, `DICT LIST/EXPORT/IMPORT/DROP`, drift detection, dict-version cap.
 - `tests/unit/compression-multi.tcl` — Q11 invariants (`WATCH` + background compression → `EXEC` does not abort; `CLIENT TRACKING` → no spurious invalidations; `EVAL` / `EXEC` semantics).
+- `tests/unit/compression-cow-invariant.tcl` — **merge-blocker**: for every mutating string command (`APPEND`, `SETRANGE`, `SET` overwrite, `GETSET`, `GETDEL`, `SETBIT`, `BITOP` write, `BITFIELD` write) and for module write-DMA, verify that enqueueing a compression job then issuing the mutation leaves the original bytes intact for the worker and produces a correct compressed frame for the post-mutation state. Fails loud if any code path mutates in place while `refcount > 1`. Implements the R2.4.5 audit via a runtime test rather than a static audit, so it protects against future drift.
 - `tests/unit/compression-persistence.tcl` — RDB save/load with active+retiring dicts; load with `compression-enabled no`; missing dict AUX rejection; AOF stays uncompressed; cross-version replication.
 - `tests/integration/compression-replication.tcl` — primary compresses, replica does not; toggle on primary does not disrupt stream.
 - `tests/unit/cluster/compression-migrate.tcl` — `MIGRATE` decompresses on source.
@@ -649,6 +672,32 @@ One scenario added to the existing benchmark workflows:
 - JSON reply schemas for all `COMPRESSION *` commands under `src/commands/`, validated by `.github/workflows/reply-schemas-linter.yml`.
 - `clang-format-18` on all new sources.
 - `.config/typos.toml` clean.
+
+### 7.5 Compression-aware benchmark suite
+
+The §7.3 primitive scenario (uniform keys, fixed 1 KiB values) validates a lower bound but does not exercise the feature's design assumptions — especially "skip hot items, compress cold items" (needs hotset skew) and "multi-key commands pay the sum of per-value costs" (needs mixed value sizes and wide-fanout commands). For v1 we therefore commit to extending `valkey-benchmark` with three general-purpose workload knobs and shipping a canonical scenario set.
+
+**`valkey-benchmark` extensions** (each independently useful beyond this feature, which strengthens the upstream case):
+
+| Flag | Semantics |
+|---|---|
+| `--key-distribution uniform\|zipf` with `--zipf-alpha ALPHA` | Default `uniform` (current behavior). `zipf` produces a skewed key-access distribution with Zipfian alpha (typical: 0.99 for GET-heavy caching). Gives us a real hotset to test the skip-hot-items policy. |
+| `--value-size-distribution constant\|uniform:MIN:MAX\|lognormal:MEAN:SIGMA` | Default `constant` (current `-d SIZE` behavior). The mixed distributions exercise `compression-min-value-size`/`compression-max-value-size` boundaries and produce realistic MGET latency curves. |
+| `--value-data random\|zero\|corpus:FILE` | Default `random` (current behavior — incompressible). `zero` = trivially compressible (upper bound on ratio). `corpus:FILE` = load a text corpus and sample substrings from it (produces realistic 50–70% compression ratios for JSON-like data). |
+
+**Canonical scenario set** under `tests/compression/benchmarks/`:
+
+| Scenario | Purpose |
+|---|---|
+| `baseline-uniform-1k` | 80/20 GET/SET, uniform keys, 1 KiB `random` values. Existing §7.3 scenario; regression floor. |
+| `realistic-hotset` | GET-heavy, `zipf-0.99` keys, `lognormal:1024:2.0` sizes, `corpus:samples/json.txt`. Exercises skip-hot-items and realistic compression ratios. |
+| `wide-mget` | `MGET` over 100 and 1000 random keys, `lognormal:1024:2.0` sizes, `corpus:samples/json.txt`. Validates the thread-1 concern (sum-of-per-value-costs for multi-key). |
+| `sort-heavy` | `SORT` of a 1000-element list where every element is a compressed value. Stresses main-thread blocking in list/set operations. |
+| `mixed-pipeline` | Pipelined GET/SET/APPEND with 20% writes on `zipf-0.99` keys. Exercises the COW invariant from R2.4.4 under realistic load. |
+
+A `tests/compression/benchmarks/run.sh` driver runs each scenario under both `compression-enabled no` and `yes`, produces a comparison report (P50, P99, P999 latency per command type; `used_memory`; `compression_ratio` from `INFO compression`), and commits a reference JSON of accepted numbers into the repo. Future changes that regress beyond a per-metric threshold are flagged for reviewer attention but remain **informational**, consistent with §7.3 policy — not a merge gate.
+
+CI runs only `baseline-uniform-1k` on every PR (cheap, seconds). The full suite runs nightly / on release candidates.
 
 ---
 
@@ -754,7 +803,7 @@ The POC implemented "block the client, decompress off-thread." Rejected for v1 b
 
 Proposed in research: sample values on the write path into a reservoir. Rejected because:
 - 10000 samples × 1 KB = 10–16 MiB of extra memory dedicated to holding copies of values already in the keyspace. For a memory-saving feature, that overhead is unacceptable.
-- Keyspace scan on `bio` uses `incrRefCount` on pointers directly into sds bodies — zero copies, zero sustained overhead.
+- Keyspace scan on the main thread + training on `bio` uses a transient contiguous training buffer (~10–16 MiB for default 10,000 × ~1 KB samples) allocated only during training. No long-lived reservoir; the buffer is freed once bio returns the trained dict.
 - Bias toward long-lived keys is actually desirable: we want the dictionary to compress data that sticks around.
 
 ### C.4 Adaptive kill-switch (rejected for v1)
@@ -779,6 +828,16 @@ Initially proposed but removed. Rejected because:
 - Application clients have no legitimate reason to subscribe.
 - Server log + `INFO` + latency monitor cover the operator needs.
 
+### C.7 IO threads for decompression / read preparation (rejected for v1, deferred to v2 exploration)
+
+IO threads already parse protocol input on a pool of worker threads and could, in theory, speculatively prepare decompressed values for read commands — amortizing decompression cost while the main thread is busy dispatching. Rejected for v1 because:
+
+- **Boundary crossing.** Correct decompression requires key lookup, object-lifetime handling, command ordering, script/transaction semantics, and revalidation against earlier commands in the same event-loop batch. These are main-thread keyspace-execution concerns, not network-IO concerns. Blurring the boundary creates a broad test matrix and subtle race classes (e.g., a key queued for decompression on an IO thread may have been deleted or overwritten by an earlier queued command in the same batch).
+- **Resource coupling.** Decompression CPU would scale with `io-threads` count — a knob sized for network parallelism, not compression workload. Operators would lose the ability to size IO bandwidth and compression CPU independently. A single workload-level bottleneck would then be ambiguous between "not enough IO capacity" and "not enough compression capacity".
+- **Simpler alternative exists.** A dedicated compression worker pool (§2.11 R2.11.1) gives the same parallelism with clean separation of concerns: background compression runs on compression workers; synchronous decompression runs on the main thread; IO threads handle only their own domain.
+
+Deferred to **v2** as a targeted optimization: speculative pre-decompression for simple read-only commands (plain `GET`, `STRLEN`, `GETRANGE`, etc.) with an object-version validation step on the main thread to detect stale speculations. This would reduce P99 latency for large-value reads without changing the sync-decompression-is-always-correct invariant enforced by §2.9 R2.9.1.
+
 ---
 
 ## Appendix D — Explicit v1 non-goals and v2 roadmap
@@ -794,7 +853,7 @@ Initially proposed but removed. Rejected because:
 | Advanced trainer parameters (`fastCover` tuning) | Yes | Planned — expose via new configs if measurement justifies. |
 | Per-key "force uncompressed" pinning | Yes | Conditional — `OBJECT` subcommand if demanded. |
 | Module-provided compression backends | Yes | Conditional — only if a concrete use case emerges. |
-| Compressed full-sync replication stream | Yes | Conditional — requires both sides to support; separate optimization. |
+| Compressed full-sync replication stream | Yes | Planned — negotiated via a new `REPLCONF compression yes` handshake. Replicas that advertise support receive the compressed RDB + dictionary AUX stream; older replicas continue to receive the v1 uncompressed stream (R2.6.8). Non-breaking. |
 | `MEMORY STATS` compression sub-aggregate | Yes | Planned — small code cost. |
 | Primary↔replica dictionary synchronization | Yes | Not planned — independent operation is the intended model. |
 

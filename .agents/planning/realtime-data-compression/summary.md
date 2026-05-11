@@ -1,0 +1,110 @@
+# Realtime data compression — feature summary
+
+**Status:** design complete, implementation planned
+**Scope:** opt-in, transparent, server-side compression of STRING values using trained ZSTD dictionaries
+**Target release:** Valkey 9.0 (tentative)
+**Owners:** @ikolomi (lead), @GilboaAWS (co-owner)
+
+---
+
+## What the feature does
+
+When enabled, Valkey keeps a small set of ZSTD compression dictionaries trained on live keyspace content and uses them to compress eligible STRING values in memory. Clients see uncompressed values on every read path (commands, scripts, replication, RDB load) — the feature is **transparent** to every client-facing API.
+
+**The one-line pitch:** compress cold, moderately-sized STRING values in memory using a dictionary trained on your actual data; pay ~1 µs/KB on decompression reads; save ~2–4× on memory for typical JSON/text workloads.
+
+## Design choices in one page
+
+| Decision | What we chose | Why |
+|---|---|---|
+| Algorithm | ZSTD with trained dictionary | Best ratio-per-CPU for small values; the dictionary is the unique value add. See Appendix A. |
+| Activation | Opt-in via `compression-enabled yes`; feature-off is the default and zero-cost | Safe rollout; operators pick when to turn it on. |
+| Eligibility | STRING only; size 256 B – 128 KiB; not EMBSTR; `write_age` + `idle_seconds` gates; per-dict incompressible-keys guard | Narrow window where the dictionary pays off and compression cost is amortized over reads. |
+| Hot path (reads) | Sync decompression on main thread, ~1 µs/KB budget | Simple, predictable; async is v2. |
+| Hot path (writes) | Async compression on dedicated worker pool; main thread never compresses | Zero client-visible write latency added. |
+| Dictionary training | On `bio` thread using a contiguous sample buffer copied by main thread; main thread never blocks on training | Avoids robj/kvstore thread-safety concerns; satisfies `ZDICT_trainFromBuffer` API. |
+| Dictionary lifecycle | Registry with monotonic IDs, refcounted, atomic promotion, max-cap enforced, drift-retrain | One-cell ABA-safe; supports multiple live dicts during rolling replacement. |
+| Persistence | Disk RDB compressed; **full-sync RDB always uncompressed in v1**; AOF compressed as uncompressed commands | Replication correctness and mixed-version compatibility come first; v2 negotiates. |
+| Concurrency invariant | Compression workers never touch `robj`; they consume flat byte buffers. Main thread owns all `robj` mutation. SDS immutability via existing `dbUnshareStringValue` COW discipline | Keeps concurrency reasoning tractable; leverages an invariant Valkey already enforces. |
+| Operator surface | 5 primary knobs (enable, size bounds, idle threshold, worker count) + 11 advanced knobs | Most operators only need the primaries. |
+
+## Requirement index
+
+36 numbered requirements across 12 sub-sections of §2 in the design doc, covering:
+
+- §2.1 Master switch + operator surface (R2.1.1–R2.1.6)
+- §2.2 Value eligibility (R2.2.1–R2.2.7)
+- §2.3 Dictionary lifecycle (R2.3.1–R2.3.12)
+- §2.4 Compression path (R2.4.1–R2.4.6)
+- §2.5 Decompression path (R2.5.1–R2.5.5)
+- §2.6 Persistence (R2.6.1–R2.6.9)
+- §2.7 AOF (R2.7.1–R2.7.3)
+- §2.8 Memory accounting (R2.8.1–R2.8.4)
+- §2.9 Scripting & transactions (R2.9.1–R2.9.3)
+- §2.10 Observability (R2.10.1–R2.10.5)
+- §2.11 CPU & concurrency (R2.11.1–R2.11.5)
+- §2.12 Configuration summary (16 knobs: 5 primary + 11 advanced)
+
+Full text: [`design/detailed-design.md`](design/detailed-design.md).
+
+## What the walkthrough changed
+
+The 2026-05-10 PR review walkthrough addressed all 31 review threads (22 self-review by @ikolomi, 9 by @GilboaAWS). Highlights of substantive design evolution:
+
+- **Defaults recalibrated:** `compression-max-value-size` 1 MiB → 128 KiB
+- **Replication reframed:** v1 full-sync RDB is uncompressed (new R2.6.8); wire negotiation deferred to v2
+- **Operator surface cut in half** for the common case (5 primary knobs vs 16 shown by default)
+- **SDS immutability made explicit:** rely on existing `dbUnshareStringValue` COW + merge-blocker audit + new `compression-cow-invariant.tcl` test (R2.4.4–R2.4.6, §7.2)
+- **Benchmark suite formalized** as §7.5 — extend `valkey-benchmark` with `--value-size-distribution`, `--value-data`, `--key-distribution` + six canonical scenarios
+- **EMBSTR excluded** from eligibility (6 places)
+- **Hotness signals decoupled from `maxmemory-policy`:** universal `write_age` + `idle_seconds` gates in every mode; LFU-freq only when LFU is active; knob renamed `compression-lru-idle-seconds` → `compression-min-idle-seconds`
+- **Retry-guard scoped by dict ID** via new `incompressibleKeys{}` side hashtable
+- **Training flow corrected:** main thread iterates + copies samples into a contiguous buffer; bio runs `ZDICT_trainFromBuffer`. Bio never touches `robj`, `kvstore`, or refcounts. Dropped incorrect "zero copies" claim
+- **Appendix §C.7 added:** io-threads explicitly rejected for decompression in v1
+
+Per-thread rationale: [`DESIGN_TODO.md`](DESIGN_TODO.md). GitHub PR with posted resolutions: https://github.com/ikolomi/valkey/pull/1.
+
+## Implementation plan summary
+
+See [`implementation/plan.md`](implementation/plan.md) for the full sequenced plan. Top-level shape:
+
+- **7 subsystems** with narrow interface contracts. @ikolomi owns the concurrency-critical pieces (S1 dict lifecycle, S2 hot path + COW audit). @GilboaAWS owns persistence (S3), observability (S4), benchmarks (S5), integration tests (S6), and dev infra (S7).
+- **Phase 0** (week 1): land compileable skeleton with stubbed public APIs + interface contracts. Joint PR.
+- **Phase 1** (weeks 2–5): parallel implementation of all subsystems; end-of-phase gate is a working single-instance demo.
+- **Phase 2** (weeks 6–9): integration + COW audit + full §7.5 benchmark run.
+- **Phase 3** (weeks 10–11): stabilize, doc, release prep.
+- **Total:** ~11 weeks calendar with parallelism (vs ~17 serial).
+
+Each subsystem's unit tests ship in the same PR as the code they cover. The §7.2 COW invariant test is a merge-blocker; the §7.5 perf run gates Phase 2.
+
+## Explicit v1 non-goals (deferred to v2)
+
+- Wire-level replication compression (`REPLCONF compression yes`)
+- IO threads for decompression
+- Async decompression path for long reads
+- LIST/HASH/ZSET per-element compression
+- Preshared/imported dictionaries
+- Hardware accelerators (AVX-512, QAT)
+- Adaptive kill-switch
+
+## Artifacts produced by this planning cycle
+
+| File | Role |
+|---|---|
+| [`idea-honing.md`](idea-honing.md) | Q1–Q16 requirements with walkthrough decisions folded in |
+| [`design/detailed-design.md`](design/detailed-design.md) | §1–§7 detailed design + Appendices A–D |
+| [`implementation/plan.md`](implementation/plan.md) | Phased parallel-ownership implementation plan |
+| [`DESIGN_TODO.md`](DESIGN_TODO.md) | 31-thread walkthrough audit trail |
+| [`pr-feedback.json`](pr-feedback.json) | Machine-readable sidecar to DESIGN_TODO |
+| [`research/`](research/) | 7 research notes backing the design (ZSTD dicts, Valkey internals, existing building blocks, prior art, etc.) |
+| [`tools/fetch-pr-comments.sh`](tools/fetch-pr-comments.sh) | GitHub REST fetcher (paginated, cached) |
+| [`tools/normalize-pr-comments.py`](tools/normalize-pr-comments.py) | Thread roll-up + DESIGN_TODO regenerator (preserves operator fields) |
+| [`tools/post-pr-replies.py`](tools/post-pr-replies.py) | Round-trip: post resolution replies + resolve threads via GraphQL |
+| [`.pr-cache/`](.pr-cache/) | Raw GitHub API JSON (gitignored; regenerate via `tools/fetch-pr-comments.sh`) |
+
+## What happens next
+
+1. **Land the plan** — open a CR against `unstable` that ships the design docs + this plan under `.agents/planning/realtime-data-compression/`.
+2. **Phase 0 kickoff** — @ikolomi and @GilboaAWS co-author the skeleton PR.
+3. **Execute the phase plan** — track progress in the task checkboxes of `plan.md`.
+4. **Revisit DESIGN_TODO during implementation** — if an implementation detail contradicts a walkthrough decision, amend the design and re-open the relevant thread for discussion before coding around it.
