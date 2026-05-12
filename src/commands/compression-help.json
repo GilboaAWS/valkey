@@ -1,0 +1,25 @@
+{
+    "HELP": {
+        "summary": "Returns helpful text about the different COMPRESSION subcommands.",
+        "complexity": "O(1)",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": 2,
+        "container": "COMPRESSION",
+        "function": "compressionCommand",
+        "command_flags": [
+            "LOADING",
+            "STALE"
+        ],
+        "acl_categories": [
+            "SLOW"
+        ],
+        "reply_schema": {
+            "type": "array",
+            "description": "Helpful text about subcommands.",
+            "items": {
+                "type": "string"
+            }
+        }
+    }
+}

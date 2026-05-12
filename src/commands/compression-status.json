@@ -1,0 +1,23 @@
+{
+    "STATUS": {
+        "summary": "Returns the current state of the real-time compression feature.",
+        "complexity": "O(1)",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": 2,
+        "container": "COMPRESSION",
+        "function": "compressionCommand",
+        "command_flags": [
+            "LOADING",
+            "STALE"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "SLOW"
+        ],
+        "reply_schema": {
+            "description": "A text block of compression-state fields, one per line in the form `compression_<field>:<value>`.",
+            "type": "string"
+        }
+    }
+}

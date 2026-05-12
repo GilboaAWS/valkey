@@ -2389,6 +2389,34 @@ struct valkeyServer {
     /* Local environment */
     char *locale_collate;
     char *debug_context; /* A free-form string that has no impact on server except being included in a crash report. */
+
+    /* ==========================================================
+     * Real-time data compression (see plan.md §5 Phase 0).
+     *
+     * Phase 0 registers the knobs so operators / orchestration can
+     * parse a valkey.conf with `compression-*` entries without the
+     * server rejecting them. The knobs have no runtime effect until
+     * Phase 1 lands the hot path. Defaults match §2.12 of the design.
+     * ==========================================================
+     */
+    /* Primary (§2.12 — 5 knobs) */
+    int    compression_enabled;               /* Master switch. Default: 0 (no). */
+    int    compression_threads;               /* Worker pool size (0..16). Default: 1. */
+    size_t compression_min_value_size;        /* Lower size bound for eligibility. Default: 256. */
+    size_t compression_max_value_size;        /* Upper size bound (0 = unbounded). Default: 131072. */
+    size_t compression_dict_size;             /* ZSTD trainer target dict size. Default: 102400. */
+    /* Advanced (§2.12 — 11 knobs) */
+    int    compression_sweep_max_cpu_pct;     /* Sweep pacing (1..100). Default: 25. */
+    char  *compression_cpulist;               /* CPU affinity list for workers. Default: "". */
+    int    compression_min_savings_ratio;     /* Post-compression net-savings guard (percent). Default: 10. */
+    int    compression_retry_interval;        /* Fallback retry period (seconds). Default: 3600. */
+    int    compression_lfu_threshold;         /* LFU skip-hot-key additional guard. Default: 5. */
+    int    compression_min_idle_seconds;      /* Universal read-hotness skip. Default: 60. */
+    int    compression_settle_seconds;        /* Universal write-recency skip. Default: 60. */
+    int    compression_dict_first_training_keys_count; /* First-training trigger. Default: 10000. */
+    int    compression_dict_drift_ratio;      /* Retrain drift trigger (percent). Default: 70. */
+    int    compression_dict_refresh_interval; /* Optional periodic retrain (seconds; 0 = disabled). Default: 0. */
+    int    compression_dict_max_versions;     /* Registry cap (min 2). Default: 4. */
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -4125,6 +4153,7 @@ int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr);
 void dumpCommand(client *c);
 void objectCommand(client *c);
 void memoryCommand(client *c);
+void compressionCommand(client *c);
 void clientCommand(client *c);
 void clientHelpCommand(client *c);
 void clientIDCommand(client *c);

@@ -96,10 +96,25 @@ static inline bool rdbUseValkeyMagic(int rdbver) {
 /* When a length of a string object stored on disk has the first two bits
  * set, the remaining six bits specify a special encoding for the object
  * accordingly to the following defines: */
-#define RDB_ENC_INT8 0  /* 8 bit signed integer */
-#define RDB_ENC_INT16 1 /* 16 bit signed integer */
-#define RDB_ENC_INT32 2 /* 32 bit signed integer */
-#define RDB_ENC_LZF 3   /* string compressed with FASTLZ */
+#define RDB_ENC_INT8 0     /* 8 bit signed integer */
+#define RDB_ENC_INT16 1    /* 16 bit signed integer */
+#define RDB_ENC_INT32 2    /* 32 bit signed integer */
+#define RDB_ENC_LZF 3      /* string compressed with FASTLZ */
+#define RDB_ENC_ZSTDDICT 4 /* string compressed with ZSTD + trained dict (reserved, unused in v1 feature-off) */
+
+/* Notes on RDB_ENC_ZSTDDICT (see realtime-data-compression design §2.6 R2.6.1):
+ * The on-disk layout for a value encoded with RDB_ENC_ZSTDDICT is
+ *     [RDB_ENCVAL | RDB_ENC_ZSTDDICT] (1 byte)
+ *     [dict_id]            (len-encoded)
+ *     [compressed_len]     (len-encoded)
+ *     [uncompressed_len]   (len-encoded)
+ *     [ZSTD frame bytes]
+ * Dictionary bytes themselves are persisted as RDB_OPCODE_AUX entries
+ * keyed "compression-dict-<dict_id>" emitted BEFORE any value that
+ * references them. Writes emitting this encoding will bump RDB_VERSION
+ * (Phase 0 reserves the value only and does not change RDB_VERSION).
+ * Load rejection of a compressed value referencing an unknown dict_id
+ * is the §2.6 R2.6.5 corruption path. */
 
 /* Map object types to RDB object types. Macros starting with OBJ_ are for
  * memory storage and may change. Instead RDB types must be fixed because

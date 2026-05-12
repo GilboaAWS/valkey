@@ -55,6 +55,8 @@
 
 #include "eval.h"
 
+#include "compression.h"
+
 #include "trace/trace_commands.h"
 
 #include <time.h>
@@ -1617,6 +1619,10 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* Handle background operations on databases. */
     databasesCron();
 
+    /* Real-time compression background work (sweep pacing, drift
+     * retrain trigger). Phase 0: no-op. */
+    compressionCron();
+
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
     if (!hasActiveChildProcess() && server.aof_rewrite_scheduled && !aofRewriteLimited()) {
@@ -2078,6 +2084,9 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     }
 
     IOThreadsAfterSleep(numevents);
+
+    /* Drain compression worker outbox (Phase 0: no-op). */
+    compressionAfterSleep();
 }
 
 /* =========================== Server initialization ======================== */
@@ -3216,6 +3225,7 @@ void initListeners(void) {
 void InitServerLast(void) {
     bioInit();
     initIOThreads(1);
+    compressionInit();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
 
     /* First set initial_memory_usage to zero as baseline for getMemoryOverheadData(). */
@@ -6733,6 +6743,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "# Cluster\r\n"
                             "cluster_enabled:%d\r\n",
                             server.cluster_enabled);
+    }
+
+    /* Compression (feature disabled in Phase 0 — see
+     * .agents/planning/realtime-data-compression/). */
+    if (all_sections || (dictFind(section_dict, "compression") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        infoCompression(&info);
     }
 
     /* Cluster Info */

@@ -1,0 +1,13 @@
+{
+    "COMPRESSION": {
+        "summary": "A container for real-time in-memory value compression operations.",
+        "complexity": "Depends on subcommand.",
+        "group": "server",
+        "since": "9.0.0",
+        "arity": -2,
+        "acl_categories": [
+            "ADMIN",
+            "SLOW"
+        ]
+    }
+}
