@@ -8,9 +8,10 @@
  * compression_header.c — Phase 0 stub (with working encode/decode).
  *
  * The header format is simple and stable enough to implement in Phase
- * 0: encode writes four uint32s in native byte order and validates the
- * magic on decode. createCompressedObject / freeCompressedObject are
- * stubs because no code path actually produces compressed frames yet.
+ * 0: encode writes four uint32s in native byte order; decode validates
+ * that alg_magic matches a known algorithm tag. createCompressedObject
+ * / freeCompressedObject are stubs because no code path actually
+ * produces compressed frames yet.
  *
  * The encode/decode helpers are written to be used by unit tests in
  * Phase 1 (per-value header round-trip tests per plan §7).
@@ -21,13 +22,26 @@
 
 #include <string.h>
 
+/* Returns 1 if `alg_magic` is a known algorithm tag. v1 only accepts
+ * the ZSTD magic; additional entries can be added without changing
+ * the on-disk/in-memory layout. */
+static int compressionAlgMagicRecognized(uint32_t alg_magic) {
+    switch (alg_magic) {
+    case COMPRESSION_ALG_ZSTD_MAGIC:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 void compressionHeaderEncode(unsigned char *dst,
-                             uint32_t dict_id,
+                             uint32_t alg_magic,
+                             uint32_t alg_meta,
                              uint32_t uncompressed_len,
                              uint32_t compressed_len) {
     compressedHeader h = {
-        .magic = COMPRESSION_HEADER_MAGIC,
-        .dict_id = dict_id,
+        .alg_magic = alg_magic,
+        .alg_meta = alg_meta,
         .uncompressed_len = uncompressed_len,
         .compressed_len = compressed_len,
     };
@@ -37,27 +51,25 @@ void compressionHeaderEncode(unsigned char *dst,
 int compressionHeaderDecode(const unsigned char *src, compressedHeader *out) {
     compressedHeader h;
     memcpy(&h, src, sizeof(h));
-    if (h.magic != COMPRESSION_HEADER_MAGIC) return -1;
+    if (!compressionAlgMagicRecognized(h.alg_magic)) return -1;
     if (out) *out = h;
     return 0;
 }
 
-robj *createCompressedObject(uint32_t dict_id,
-                             const void *compressed_frame,
-                             uint32_t compressed_len,
-                             uint32_t uncompressed_len) {
-    UNUSED(dict_id);
-    UNUSED(compressed_frame);
-    UNUSED(compressed_len);
-    UNUSED(uncompressed_len);
+robj *createCompressedObject(void *buffer, size_t buffer_len) {
+    UNUSED(buffer);
+    UNUSED(buffer_len);
     /* Phase 0: feature disabled, we never allocate compressed robjs.
-     * Returning NULL signals "fall back to uncompressed storage" to the
-     * future Phase 1 installer. */
+     * Returning NULL signals "fall back to uncompressed storage" to
+     * the Phase 1 installer. Note the header contract: on NULL
+     * return the caller retains ownership of `buffer` and must
+     * reclaim it with zfree — Phase 1 will follow the same rule for
+     * the validation-failure path. */
     return NULL;
 }
 
 void freeCompressedObject(robj *o) {
     UNUSED(o);
     /* Phase 0: no-op. In Phase 1 this will zfree(o->val_ptr) and
-     * compressionRegistryDecRef(header.dict_id). */
+     * compressionRegistryDecRef(header.alg_meta). */
 }

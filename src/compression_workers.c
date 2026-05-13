@@ -38,14 +38,12 @@ int compressionWorkersResize(int n_threads) {
 int compressionWorkersEnqueue(const sds key,
                               int dbid,
                               uint64_t version,
-                              const unsigned char *src,
-                              size_t src_len,
+                              sds src,
                               uint32_t active_dict_id) {
     UNUSED(key);
     UNUSED(dbid);
     UNUSED(version);
     UNUSED(src);
-    UNUSED(src_len);
     UNUSED(active_dict_id);
     /* Phase 0: accept-and-drop. Callers are expected to have held an
      * incrRefCount on the robj; they must decrRefCount independently

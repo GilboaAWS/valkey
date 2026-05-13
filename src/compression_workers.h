@@ -61,14 +61,21 @@ int  compressionWorkersResize(int n_threads);
  * valid for the worker AND the COW invariant (§2.4 R2.4.4) is enforced
  * on any subsequent mutating command.
  *
+ * `src` is the sds body of the candidate value; the worker calls
+ * `sdslen(src)` to get the length (safe across threads because the
+ * immutable-snapshot invariant guarantees the sds metadata bytes are
+ * not mutated while the worker holds the reference). `active_dict_id`
+ * is the snapshot of the registry's active dict at enqueue time —
+ * see §4.6 rationale for why the main thread captures this rather
+ * than letting the worker read the registry.
+ *
  * Returns 0 on success, -1 if the inbox is full (caller drops the
  * candidate — it will be retried by the next sweep tick).
  */
 int compressionWorkersEnqueue(const sds key,
                               int dbid,
                               uint64_t version,
-                              const unsigned char *src,
-                              size_t src_len,
+                              sds src,
                               uint32_t active_dict_id);
 
 /* ========================================================================
@@ -77,8 +84,10 @@ int compressionWorkersEnqueue(const sds key,
  *
  * Polled from compressionAfterSleep. Processes up to `budget` results,
  * installing compressed buffers into the owning robjs (via
- * createCompressedObject) and running the net-savings guard
- * (§2.4 R2.4.3). Returns the number of results processed.
+ * createCompressedObject — which takes ownership of the flat buffer
+ * produced by the worker; see compression_header.h for the zero-copy
+ * contract) and running the net-savings guard (§2.4 R2.4.3). Returns
+ * the number of results processed.
  */
 int compressionWorkersDrainOutbox(int budget);
 

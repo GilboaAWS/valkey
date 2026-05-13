@@ -140,17 +140,17 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 ### 2.6 Persistence
 
 - **R2.6.1** **RDB on-disk format** (Q12, research `persistence-and-replication.md`):
-  - New string encoding marker `RDB_ENC_ZSTDDICT` (value `4`).
-  - Layout per compressed value: `[RDB_ENCVAL | dictID (len-encoded) | compressed_len (len-encoded) | uncompressed_len (len-encoded) | ZSTD frame bytes]`.
-  - Dictionary bytes are written as `RDB_OPCODE_AUX` entries (key `"compression-dict-<N>"`, value = raw bytes) **before** any compressed value that references them.
+  - New string encoding marker `RDB_ENC_COMPRESSED` (value `4`). The marker is generic — it says "a compressed payload follows" without naming the algorithm, so future backends (LZ4, snappy, hardware) can reuse the same encoding byte.
+  - Layout per compressed value: `[RDB_ENCVAL | alg_magic (len-encoded) | alg_meta (len-encoded) | uncompressed_len (len-encoded) | compressed_len (len-encoded) | compressed frame bytes]`. `alg_magic` is the four-byte algorithm tag (ASCII `ZSTD`, reserved `LZ4 ` etc.); `alg_meta` is interpreted per algorithm — for ZSTD it is the `dict_id` of the referenced dictionary, for a hypothetical LZ4 backend it would be `0` or mode bits. Unknown `alg_magic` → reject as corrupt.
+  - Dictionary bytes (ZSTD-specific) are written as `RDB_OPCODE_AUX` entries (key `"compression-dict-<dict_id>"`, value = raw bytes) **before** any compressed value that references them. Non-dict-based algorithms may omit AUX.
   - `RDB_VERSION` is bumped (`80 → 81`). Pre-feature loaders will refuse the file cleanly.
 - **R2.6.2** **RDB load when `compression-enabled yes`**: loader reads the dictionary bytes from AUX entries and uses them to construct `ZSTD_CDict`/`ZSTD_DDict` handles (via `ZSTD_createCDict`/`ZSTD_createDDict`; no retraining), inserts them into the registry, decompresses values on the fly only if needed (frames reference their dictID so they stay compressed in memory). (Q3, Q12)
-- **R2.6.3** **RDB load when `compression-enabled no`**: loader reads the dictionary bytes from AUX entries and constructs only the `ZSTD_DDict` handles needed (no retraining), decompresses every `RDB_ENC_ZSTDDICT`-marked value inline, stores uncompressed, discards DDicts after load. (Q3)
+- **R2.6.3** **RDB load when `compression-enabled no`**: loader reads the dictionary bytes from AUX entries and constructs only the `ZSTD_DDict` handles needed (no retraining), decompresses every `RDB_ENC_COMPRESSED`-marked value inline, stores uncompressed, discards DDicts after load. (Q3)
 - **R2.6.4** **Missing dictionary**: if a compressed value references a dictID for which no AUX entry was emitted, the RDB is rejected as corrupt regardless of the `compression-enabled` setting. (Q3)
 - **R2.6.5** **AOF**: always uncompressed RESP. Writer routes every `robj` through `objectGetUncompressedView` before emitting. (Q12)
 - **R2.6.6** **Replication feed**: always uncompressed RESP. `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. Cross-version replication unaffected. (Q12)
 - **R2.6.7** **`DUMP` / `RESTORE` / `MIGRATE`**: v1 decompresses before emitting the RDB chunk. Compressed-in-place migration is v2. (Q12)
-- **R2.6.8** **Full-sync replication RDB** (primary → replica during `SYNC`/`PSYNC` full resync): emitted **uncompressed** regardless of `compression-enabled` state on the primary. When the RDB writer is invoked with a replication sink, every compressed value is routed through `objectGetUncompressedView` before serialization — same helper used by `feedReplicationBufferWithObject`. Disk RDB (local save / `BGSAVE` target) continues to use the `RDB_ENC_ZSTDDICT` path from R2.6.1. This keeps cross-version replication working without replica-side awareness and preserves the "wire stays uncompressed RESP/RDB, disk may be compressed" property. Opt-in compressed full-sync (via `REPLCONF` negotiation) is a v2 extension point. (Q12)
+- **R2.6.8** **Full-sync replication RDB** (primary → replica during `SYNC`/`PSYNC` full resync): emitted **uncompressed** regardless of `compression-enabled` state on the primary. When the RDB writer is invoked with a replication sink, every compressed value is routed through `objectGetUncompressedView` before serialization — same helper used by `feedReplicationBufferWithObject`. Disk RDB (local save / `BGSAVE` target) continues to use the `RDB_ENC_COMPRESSED` path from R2.6.1. This keeps cross-version replication working without replica-side awareness and preserves the "wire stays uncompressed RESP/RDB, disk may be compressed" property. Opt-in compressed full-sync (via `REPLCONF` negotiation) is a v2 extension point. (Q12)
 
 ### 2.7 Introspection surfaces
 
@@ -289,7 +289,7 @@ All feature integration happens at a small, well-defined set of seams:
 - **Write path** (`dbAddInternal`, `dbSetValue`, `dbOverwrite` in `src/db.c`): on insert/overwrite, check eligibility and enqueue on the candidate inbox. Compression itself happens later, off-thread.
 - **Replication feed** (`feedReplicationBufferWithObject` in `src/replication.c`): routes through `objectGetUncompressedView`.
 - **AOF writer**: routes through `objectGetUncompressedView`.
-- **RDB writer/reader** (`src/rdb.c`): new encoding marker `RDB_ENC_ZSTDDICT` + AUX entries for dicts.
+- **RDB writer/reader** (`src/rdb.c`): new encoding marker `RDB_ENC_COMPRESSED` + AUX entries for dicts.
 - **Cron** (`serverCron` in `src/server.c`): sweep tick enqueues candidates; dict age / drift is evaluated.
 - **`afterSleep` hook**: polls the MPSC outbox and installs compressed frames.
 
@@ -343,8 +343,8 @@ All new source files live under `src/`. Every `.c` is registered in **both** `sr
 | `src/t_string.c` | `getCommand`, `appendCommand`, `strlenCommand`, `getrangeCommand`, `setrangeCommand` etc. route through `objectGetUncompressedView` for reads and decompress-in-place for writes on compressed values. |
 | `src/replication.c` | `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. |
 | `src/aof.c` | `feedAppendOnlyFile` path routes through `objectGetUncompressedView`. |
-| `src/rdb.c` | `RDB_ENC_ZSTDDICT` encode/decode; AUX emission/load for dictionary bytes; bump `RDB_VERSION` to `81`. |
-| `src/rdb.h` | `#define RDB_ENC_ZSTDDICT 4`; bump `RDB_VERSION`. |
+| `src/rdb.c` | `RDB_ENC_COMPRESSED` encode/decode; AUX emission/load for dictionary bytes; bump `RDB_VERSION` to `81`. |
+| `src/rdb.h` | `#define RDB_ENC_COMPRESSED 4`; bump `RDB_VERSION`. |
 | `src/debug.c` | `DEBUG OBJECT` prints `dictID`, `compressedlength`, `uncompressedlength` for compressed values. |
 | `src/evict.c` | No change — `zmalloc_size`-based accounting handles compressed robjs automatically. |
 | `src/module.c` | `RM_StringDMA` (read): transparently returns decompressed view. `RM_StringDMA` (write) on compressed value: decompress in place first. |
@@ -437,13 +437,23 @@ typedef struct compressionJob {
     robj         *key;         /* key name, used to resolve robj later */
     int           dbid;
     uint64_t      version;     /* robj version counter; detects concurrent rewrites */
-    unsigned char *src;        /* pointer into value sds at enqueue time (held via incrRefCount) */
-    size_t        src_len;
-    uint32_t      dictID;      /* snapshot of active dictID at enqueue */
+    sds           src;         /* value sds at enqueue time (held via incrRefCount).
+                                  The worker reads sdslen(src) to get the length — no
+                                  separate src_len needed, and safe across threads
+                                  because the immutable-snapshot invariant (R2.4.4)
+                                  guarantees the sds metadata bytes are not mutated
+                                  while the worker holds the reference. */
+    uint32_t      dict_id;     /* snapshot of active dict_id at enqueue (see rationale
+                                  below) */
     /* filled by worker: */
-    unsigned char *dst;        /* compressed bytes */
-    size_t         dst_len;
-    int            err;        /* 0 = ok, else ZSTD error */
+    void         *dst;         /* zmalloc'd buffer: compressedHeader + compressed frame.
+                                  Ownership transfers to the main thread on outbox
+                                  delivery; main thread hands it to
+                                  createCompressedObject() which installs it into the
+                                  robj without a memcpy (see compression_header.h for
+                                  the zero-copy ownership contract). */
+    size_t        dst_len;     /* total bytes in `dst` (header + frame) */
+    int           err;         /* 0 = ok, else ZSTD error */
 } compressionJob;
 ```
 
@@ -451,6 +461,10 @@ typedef struct compressionJob {
 - Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker **and** the object has `refcount >= 2`, which forces any subsequent mutating command to COW instead of mutating in place (Valkey's `dbUnshareStringValue` discipline — see R2.4.4 and R2.4.5 for the invariant and its enforcement).
 - On the outbox side, the main thread re-fetches the current `robj` for the key; if it has changed (version counter moved), the compressed result is discarded.
 - `decrRefCount(val)` is called after the outbox handler finishes. This drops the refcount back to 1 and restores in-place-mutate eligibility for future commands.
+
+**Why the main thread snapshots `dict_id` at enqueue** (rather than letting the worker read `registry->active`): the registry is documented in §4.4 as single-writer with no worker readers. If the worker read `active` at compress time, it would become a reader, and refcount management would have to be thread-safe from workers too — incref-on-load with retry against retirement, decref-on-done on every path. Snapshotting `dict_id` at enqueue on the main thread, paired with the existing refcount bump, keeps the registry's concurrency surface at "main-thread writes, no reads from workers." Staleness is bounded and harmless: if retraining promotes a new dict between enqueue and worker pickup, the in-flight job compresses with the older (still valid) dict, the frame carries its `dict_id` so decompression continues to work, and the next enqueue picks up the new dict.
+
+**Why the worker produces a flat `dst` buffer and not an `robj`**: this is the §2.11 R2.11.4 invariant — compression workers never touch `robj`. Three reasons it stays this way: (1) `robj` manipulation in Valkey assumes single-threaded access (no atomics on refcount, shared-object singletons, LRU/LFU bit updates, encoding-tag swaps); moving `robj` work to workers would silently break those assumptions. (2) Failed compressions (net-savings guard in R2.4.3) are cheap to discard — `zfree(dst)` — rather than allocate-and-free an entire `robj` container. (3) The `robj` container still has to be allocated and installed on the main thread anyway, because it carries LRU/LFU bits inherited from the old object and has to be swapped into the kvstore. Worker-side flat buffer + main-thread `createCompressedObject(buffer, len)` splits the work along the invariant without a memcpy — the zero-copy ownership contract in `compression_header.h` makes this explicit.
 
 ---
 
@@ -473,36 +487,48 @@ robj { type=OBJ_STRING, encoding=OBJ_ENCODING_COMPRESSED, hasembval=0, val_ptr �
 ### 5.2 Per-value compressed buffer
 
 ```
-+-----------------------+------------------+
-| compressedHeader      | ZSTD frame bytes |
-|   (16 bytes total)    |                  |
-+-----------------------+------------------+
++---------------------------+---------------------------+
+| compressedHeader          | compressed frame bytes    |
+|   (16 bytes total)        |                           |
++---------------------------+---------------------------+
 
 compressedHeader {
-    uint32_t magic;          /* 0x5A 0x44 0x49 0x43 = "ZDIC" - sanity check */
-    uint32_t dictID;         /* references a registry entry */
+    uint32_t alg_magic;      /* algorithm tag, doubles as magic:
+                                'Z','S','T','D' (0x4454535A) = ZSTD + trained dict
+                                reserved: 'L','Z','4',' ' (0x20345A4C) = LZ4
+                                unknown → reject as corrupt */
+    uint32_t alg_meta;       /* per-algorithm metadata:
+                                ZSTD = dict_id of the registry entry
+                                LZ4  = 0 (reserved for future flags) */
     uint32_t uncompressed_len;
-    uint32_t compressed_len; /* total frame bytes, excluding header */
+    uint32_t compressed_len; /* frame bytes, excluding this header */
 }
 ```
 
+**Why a generic algorithm tag** (rather than a bare `dict_id`): the in-memory header and the matching on-disk RDB layout (§2.6 R2.6.1) are write-once formats. Reserving an explicit `alg_magic` in Phase 0 lets v2 add LZ4 / snappy / hardware-accelerated backends without another encoding-byte migration. The tag doubles as corruption magic (wrong pattern → reject), so there is no size cost for the generality. v1 only emits / accepts the ZSTD magic.
+
 Total on-heap footprint per value = `sizeof(compressedHeader) + compressed_len + robj overhead`. `zmalloc_size` reports this automatically.
+
+**Ownership contract for the buffer** (see `compression_header.h`): the buffer is allocated by the compression worker via `zmalloc`. The worker writes the header at offset 0 and compresses directly into the remaining space. `createCompressedObject(buffer, len)` takes ownership of `buffer` — no memcpy — and the `robj` it returns reclaims the buffer via `zfree` at free time. The Phase 1 installer MUST preserve the zero-copy contract; copying the buffer into a new allocation would silently shift the compressed payload's memcpy cost onto the main thread's hot path.
+
+**Worker shrink decision** (affects the compressed-size-vs-allocated-size story): `ZSTD_compress_usingCDict` requires the worker to allocate up to `ZSTD_compressBound(src_len)` before compression because the actual output size is known only after the call returns. For typical 1 KB values this over-allocates by ~500 B. The worker shrinks the buffer to `sizeof(compressedHeader) + actual_compressed_len` via `zrealloc` before posting to the outbox. This may copy if the shrink crosses a jemalloc size-class boundary, but the copy is (a) of the compressed bytes only — at most a few hundred bytes to a few KB — and (b) paid on the worker thread, not on the main-thread hot path. The alternative of not shrinking would leak the bound's slack into `used_memory`, undermining the feature's memory-saving goal.
 
 ### 5.3 RDB encoding
 
-`RDB_ENC_ZSTDDICT = 4` (new). When the writer emits a compressed string it writes:
+`RDB_ENC_COMPRESSED = 4` (new). When the writer emits a compressed string it writes:
 
 ```
-[ 0xC0 | RDB_ENC_ZSTDDICT ]        // one byte (RDB_ENCVAL | encoding)
-[ len-encoded dictID ]
-[ len-encoded compressed_len ]
+[ 0xC0 | RDB_ENC_COMPRESSED ]      // one byte (RDB_ENCVAL | encoding)
+[ len-encoded alg_magic ]           // algorithm tag, e.g. ASCII "ZSTD"
+[ len-encoded alg_meta ]            // per-alg: ZSTD uses dict_id
 [ len-encoded uncompressed_len ]
-[ compressed_len bytes of ZSTD frame ]
+[ len-encoded compressed_len ]
+[ compressed_len bytes of compressed frame ]
 ```
 
-Dictionary bytes are emitted as `RDB_OPCODE_AUX` entries (key = `"compression-dict-<dictID>"`, value = raw dictionary bytes). **AUX entries for a dict MUST be written before any compressed value referencing it.**
+For the ZSTD+trained-dict algorithm, dictionary bytes are emitted as `RDB_OPCODE_AUX` entries (key = `"compression-dict-<dict_id>"`, value = raw dictionary bytes). **AUX entries for a dict MUST be written before any compressed value referencing it.** Algorithms that do not use dictionaries (e.g., plain LZ4 in a future version) omit AUX.
 
-`RDB_VERSION` bumps `80 → 81`. Older loaders refuse the file (`rdb.c` already rejects unknown string encoding markers); new loaders accept both old and new files.
+`RDB_VERSION` bumps `80 → 81`. Older loaders refuse the file (`rdb.c` already rejects unknown string encoding markers); new loaders accept both old and new files. Unknown `alg_magic` in a new-version file is rejected as corruption.
 
 ### 5.4 Global state
 
@@ -592,7 +618,7 @@ See §4.6 `compressionJob`.
 
 ### 6.5 RDB integrity
 
-- `RDB_ENC_ZSTDDICT` value with missing dictionary AUX → RDB rejected as corrupt. `valkey-check-rdb` reports which dictID is missing.
+- `RDB_ENC_COMPRESSED` value with missing dictionary AUX → RDB rejected as corrupt. `valkey-check-rdb` reports which dictID is missing.
 - Header magic mismatch on in-memory compressed value → logged `LL_WARNING`, treated as corruption (R6.2 path).
 
 ### 6.6 Net-savings guard failure
@@ -756,7 +782,7 @@ Reasons:
 
 ### B.4 Persistence and replication (`research/persistence-and-replication.md`)
 
-- RDB already has a precedent for "new encoding marker means special payload follows" (`RDB_ENC_LZF`). We add `RDB_ENC_ZSTDDICT`.
+- RDB already has a precedent for "new encoding marker means special payload follows" (`RDB_ENC_LZF`). We add `RDB_ENC_COMPRESSED` as a generic tag so future algorithms reuse the same encoding byte.
 - `RDB_VERSION` must bump because older loaders would reject the new encoding anyway — we bump so the rejection is a clean "too new" rather than "unknown encoding".
 - Replication feed and AOF stay uncompressed (steady-state RESP is the wire contract; cross-version replication keeps working).
 - `DUMP`/`RESTORE`/`MIGRATE` decompress-before-serialize in v1; compressed-in-place is v2.
