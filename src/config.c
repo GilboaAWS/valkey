@@ -3525,7 +3525,7 @@ standardConfig static_configs[] = {
     createSizeTConfig("compression-dict-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_dict_size, 102400, MEMORY_CONFIG, NULL, NULL),
     /* Advanced knobs (11) */
     createIntConfig("compression-sweep-max-cpu-pct", NULL, MODIFIABLE_CONFIG, 1, 100, server.compression_sweep_max_cpu_pct, 25, INTEGER_CONFIG, NULL, NULL),
-    createStringConfig("compression-cpulist", "compression_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.compression_cpulist, NULL, NULL, NULL),
+    createStringConfig("compression-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.compression_cpulist, NULL, NULL, NULL),
     createIntConfig("compression-min-savings-ratio", NULL, MODIFIABLE_CONFIG, 0, 100, server.compression_min_savings_ratio, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-retry-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_retry_interval, 3600, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("compression-lfu-threshold", NULL, MODIFIABLE_CONFIG, 0, 255, server.compression_lfu_threshold, 5, INTEGER_CONFIG, NULL, NULL),
