@@ -175,9 +175,22 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 ### 2.10 Observability
 
 - **R2.10.1** New `INFO compression` section with the following fields (see §5.6):
-  `compression_enabled`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. (Q10)
+  `compression_enabled`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_sweep_pacing_sleeps_total`, `compression_outbox_backpressure_total`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. (Q10)
 - **R2.10.2** Latency-monitor events `compress-sync`, `decompress-sync`, `compression-train` use the existing `latency-monitor-threshold` floor. No new config. (Q10)
 - **R2.10.3** **No keyspace notifications** for compression events. Operator audit trail is provided by server log entries at `LL_NOTICE` (normal transitions) and `LL_WARNING` (training failures, cap reached). (Q10)
+- **R2.10.4** **Queue back-pressure observability contract.** The worker pool is fed by a single shared bounded queue (§4.6), so "compression is not keeping up" has several distinct root causes and each one has a different remediation. The `INFO compression` section exposes four counters plus one gauge so operators can disambiguate without reading logs:
+
+  | Metric | Increments when | Remedy if climbing |
+  |---|---|---|
+  | `compression_candidates_pending` *(gauge)* | sampled at INFO time — current inbox depth | — (baseline signal) |
+  | `compression_candidates_dropped_total` | write-path enqueue (`dbAdd` / `dbOverwrite` / `dbSetValue`) or multi-key fan-out enqueue finds the inbox full and drops the candidate | raise `compression-threads`; the sweeper will catch dropped keys on its next tick, but while this counter rises some keys are temporarily uncompressed |
+  | `compression_sweep_backpressure_total` | the background or manual sweep pauses its iteration cursor because the inbox is full (distinct from CPU-pacing) | raise `compression-threads`; the sweep is ready to generate more work but workers can't absorb it |
+  | `compression_sweep_pacing_sleeps_total` | the sweep sleeps because of `compression-sweep-max-cpu-pct` (normal operation) | raise `compression-sweep-max-cpu-pct` if faster keyspace coverage is desired |
+  | `compression_outbox_backpressure_total` | a worker retries posting a result because the outbox is full (main thread hasn't drained fast enough) | raise the `compressionAfterSleep` drain budget; generally indicates a bigger main-loop problem |
+
+  **Why `sweep_backpressure_total` and `sweep_pacing_sleeps_total` are distinct:** the sweep has two reasons to sleep — workers can't keep up vs. operator-configured pacing — and they have different remedies (more workers vs. looser pacing). Folding them into one counter would prevent operators from telling which knob to turn.
+
+  **Why write-path drops and future multi-key fan-out drops share one counter:** both are "caller dropped a candidate because the inbox was full" and both are resolved by the same remediation. Distinguishing them does not drive a different action; splitting later is non-breaking if operational experience argues for it.
 
 ### 2.11 CPU and concurrency
 
@@ -430,6 +443,23 @@ Reuse the existing queue primitives from `src/queues.h`:
 - **`spmcQueue`** — main thread (producer) enqueues candidates; N workers dequeue. Matches `io_threads` shared inbox shape.
 - **`mpscQueue`** — N workers produce compressed results; main thread consumes. Matches `io_threads` outbox shape.
 
+**Shared queues, not per-worker.** The feature uses a single shared SPMC inbox fed by the main thread and drained by the worker pool, plus a single shared MPSC outbox producing back to the main thread. No per-worker queues. Rationale: (a) work-stealing falls out by construction — idle workers race to dequeue, so if one worker stalls (cold CDict cache, a large value, kernel throttling) the others keep draining without any scheduler decision; (b) enqueue is a single ring-buffer CAS regardless of pool size — per-worker queues would need "pick a worker" logic (round-robin, shortest-queue, work-stealing) that cost more on the main thread and balance worse when jobs vary in cost; (c) same shape as `io_threads.c`, minimizing review surface and reusing the queue primitives directly.
+
+**Sizing.** Inbox capacity = `max(256, 128 * compression-threads)`; outbox capacity equals inbox capacity (never more results in flight than jobs). For `compression-threads=16` that's 2048 slots × ~48 B per `compressionJob` ≈ 100 KB — immaterial for a memory-saving feature. The floor of 256 ensures a single-thread pool still absorbs burstiness. No new config knob in v1; the formula is computed at pool-start from `compression-threads`. If operational experience shows the formula is wrong, exposing `compression-candidate-queue-size` later is a non-breaking addition.
+
+**Back-pressure policy.** Every caller must treat "inbox full" as a recoverable condition; the specific handling differs by caller so operators can diagnose the cause:
+
+| Caller | Policy on inbox full | Counter |
+|---|---|---|
+| Write-path hook (`dbAdd`/`dbOverwrite`/`dbSetValue`) | Drop the candidate; the sweeper will re-discover the key on its next tick. | `compression_candidates_dropped_total` |
+| Background sweeper | Pause iteration at the current shard cursor and return from the tick; resume from the same cursor next tick. Distinct from CPU-pacing sleeps. | `compression_sweep_backpressure_total` |
+| Manual `COMPRESSION SWEEP` | Same as background sweeper — pause at cursor, resume when inbox has room. An explicit operator command should eventually make progress, not silently drop. | `compression_sweep_backpressure_total` |
+| Multi-key compression fan-out (future) | Drop; the main compression path will re-enqueue the affected keys on subsequent writes or sweep ticks. | `compression_candidates_dropped_total` |
+
+The outbox side has its own back-pressure: if a worker has a result to post but the MPSC outbox is full (main thread has not drained `compressionAfterSleep` often enough), the worker retries rather than drops — discarding a completed compression would waste CPU work already done. Retries are observed via `compression_outbox_backpressure_total`. Steady-state outbox saturation indicates a main-loop problem rather than a compression-feature problem, but surfacing the counter keeps the diagnostic honest.
+
+Both back-pressure events are categorized separately from the normal operating signals (`compression_candidates_pending` gauge, `compression_sweep_pacing_sleeps_total`) so operators can identify the exact root cause without reading logs. See §2.10 R2.10.4 for the remediation table.
+
 Job structure:
 
 ```c
@@ -586,6 +616,10 @@ See §4.6 `compressionJob`.
 | `compression_live_ratio_10m` | EMA, 10-minute window |
 | `compression_net_saved_bytes` | `total_uncompressed - total_compressed - fixed_overhead_bytes` |
 | `compression_candidates_pending` | queue depth (worker inbox) |
+| `compression_candidates_dropped_total` | counter; incremented by write-path and multi-key fan-out enqueues when the inbox is full (see §2.10 R2.10.4, §4.6) |
+| `compression_sweep_backpressure_total` | counter; incremented when the sweep pauses iteration because the inbox is full (distinct from CPU-pacing) |
+| `compression_sweep_pacing_sleeps_total` | counter; incremented when the sweep sleeps because of `compression-sweep-max-cpu-pct` |
+| `compression_outbox_backpressure_total` | counter; incremented when a worker retries posting a result because the outbox is full |
 | `compression_compressions_per_sec` | EMA, 1-second window |
 | `compression_decompressions_per_sec` | EMA, 1-second window |
 | `compression_skipped_incompressible` | counter |

@@ -100,13 +100,14 @@ void compressionEnqueueCandidate(const sds key, robj *o) {
 static const char *kDisabledReply =
     "compression is not enabled in this build (BUILD_ZSTD=no or feature disabled)";
 
-int compressionStatus(client *c) {
-    /* Phase 0: return a static INFO-style bulk string.
-     * The field set matches §2.10 R2.10.1 so callers wiring dashboards
-     * against Phase 0 servers can do so without waiting for the
-     * feature-on observability implementation. */
-    sds s = sdsempty();
-    s = sdscatprintf(s,
+/* Emit the full set of INFO-compression fields as plain "name:value"
+ * lines into `out`. Shared between COMPRESSION STATUS and
+ * genValkeyInfoString's # Compression section so the two can never
+ * diverge (§4.5: "COMPRESSION STATUS returns the INFO compression
+ * section as a flat structured reply"). Phase 0: every field is 0 /
+ * "disabled" because the feature is inert. */
+static sds compressionRenderFields(sds out) {
+    return sdscatprintf(out,
         "compression_enabled:0\r\n"
         "compression_state:disabled\r\n"
         "compression_active_dict_id:0\r\n"
@@ -119,12 +120,24 @@ int compressionStatus(client *c) {
         "compression_live_ratio_10m:0\r\n"
         "compression_net_saved_bytes:0\r\n"
         "compression_candidates_pending:0\r\n"
+        "compression_candidates_dropped_total:0\r\n"
+        "compression_sweep_backpressure_total:0\r\n"
+        "compression_sweep_pacing_sleeps_total:0\r\n"
+        "compression_outbox_backpressure_total:0\r\n"
         "compression_compressions_per_sec:0\r\n"
         "compression_decompressions_per_sec:0\r\n"
         "compression_skipped_incompressible:0\r\n"
         "compression_training_last_duration_ms:0\r\n"
         "compression_training_last_sample_count:0\r\n"
         "compression_errors_total:0\r\n");
+}
+
+int compressionStatus(client *c) {
+    /* Phase 0: return a static INFO-style bulk string.
+     * The field set matches §2.10 R2.10.1 so callers wiring dashboards
+     * against Phase 0 servers can do so without waiting for the
+     * feature-on observability implementation. */
+    sds s = compressionRenderFields(sdsempty());
     addReplyVerbatim(c, s, sdslen(s), "txt");
     sdsfree(s);
     return C_OK;
@@ -201,12 +214,6 @@ void compressionCommand(client *c) {
 
 void infoCompression(sds *info) {
     if (!info || !*info) return;
-    *info = sdscatprintf(*info,
-        "# Compression\r\n"
-        "compression_enabled:0\r\n"
-        "compression_state:disabled\r\n"
-        "compression_compressed_objects:0\r\n"
-        "compression_total_uncompressed_bytes:0\r\n"
-        "compression_total_compressed_bytes:0\r\n"
-        "compression_net_saved_bytes:0\r\n");
+    *info = sdscatprintf(*info, "# Compression\r\n");
+    *info = compressionRenderFields(*info);
 }

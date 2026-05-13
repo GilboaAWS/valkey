@@ -27,6 +27,40 @@ start_server {tags {"compression"}} {
         assert_match "*compression_active_dict_id:0*" $status
     }
 
+    test {COMPRESSION STATUS and INFO compression emit identical field sets} {
+        # Per design §4.5: "COMPRESSION STATUS returns the INFO
+        # compression section as a flat structured reply". The two
+        # renderers MUST stay in lockstep so dashboards can use either.
+        set status [r compression status]
+        set info [r info compression]
+        # Extract all "compression_*:..." field names from each.
+        set status_fields {}
+        foreach line [split $status "\n"] {
+            if {[regexp {^(compression_[a-z_]+):} $line -> name]} {
+                lappend status_fields $name
+            }
+        }
+        set info_fields {}
+        foreach line [split $info "\n"] {
+            if {[regexp {^(compression_[a-z_]+):} $line -> name]} {
+                lappend info_fields $name
+            }
+        }
+        assert_equal [lsort $status_fields] [lsort $info_fields]
+    }
+
+    test {Queue back-pressure observability fields are present (design §2.10 R2.10.4)} {
+        # These counters distinguish "compression isn't keeping up" root
+        # causes; they MUST be emitted even when the feature is off so
+        # dashboards can wire against Phase 0 servers.
+        set status [r compression status]
+        assert_match "*compression_candidates_pending:0*" $status
+        assert_match "*compression_candidates_dropped_total:0*" $status
+        assert_match "*compression_sweep_backpressure_total:0*" $status
+        assert_match "*compression_sweep_pacing_sleeps_total:0*" $status
+        assert_match "*compression_outbox_backpressure_total:0*" $status
+    }
+
     test {COMPRESSION HELP returns helpful text} {
         set help [r compression help]
         assert {[llength $help] > 0}
