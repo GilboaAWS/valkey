@@ -66,7 +66,7 @@
  *     COMPRESSION_ALG_SNAPPY_MAGIC  = 'S','N','A','P' = 0x50414E53u
  */
 
-#define COMPRESSION_HEADER_SIZE  16u    /* sizeof(compressedHeader) */
+#define COMPRESSION_HEADER_SIZE 16u /* sizeof(compressedHeader) */
 
 typedef struct compressedHeader {
     uint32_t alg_magic;
@@ -95,8 +95,8 @@ void compressionHeaderEncode(unsigned char *dst,
 /* Reads a header from `src` and validates that alg_magic is one of the
  * supported algorithms. Returns 0 on success, -1 if the magic is not
  * recognized (caller treats as corrupt value). */
-int  compressionHeaderDecode(const unsigned char *src,
-                             compressedHeader *out);
+int compressionHeaderDecode(const unsigned char *src,
+                            compressedHeader *out);
 
 /* ========================================================================
  * robj allocation / free helpers

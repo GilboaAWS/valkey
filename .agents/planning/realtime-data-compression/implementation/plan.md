@@ -42,7 +42,7 @@ Each subsystem is owned end-to-end — code + unit tests ship in the same PR. De
 
 ## 4. Interface contracts (Phase 0 deliverable)
 
-All inter-subsystem interactions go through these contracts. Phase 0 lands **compileable skeleton headers** with stubs returning sensible defaults (NULL dicts, pass-through encoders). No subsystem builds against another's internal state.
+All inter-subsystem interactions go through these contracts. Phase 0 lands **compilable skeleton headers** with stubs returning sensible defaults (NULL dicts, pass-through encoders). No subsystem builds against another's internal state.
 
 ### 4.1 `compression.h` — public API surface (owned: S2)
 

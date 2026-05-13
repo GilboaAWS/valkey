@@ -85,7 +85,7 @@ robj *objectGetUncompressedView(robj *o, sds *scratch);
  * Runs on the main thread. Cheap; designed to be inlined at the call site
  * once the Phase 1 eligibility predicate lands.
  */
-int  compressionIsEligible(const robj *o, const sds key);
+int compressionIsEligible(const robj *o, const sds key);
 void compressionEnqueueCandidate(const sds key, robj *o);
 
 /* ========================================================================
@@ -101,13 +101,13 @@ void compressionEnqueueCandidate(const sds key, robj *o);
 void compressionCommand(client *c);
 
 /* Individual subcommand entry points, exposed for unit tests. */
-int  compressionStatus(client *c);
-int  compressionForceTrain(client *c);
-int  compressionSweep(client *c, int direction /* 1 = compress, -1 = decompress */);
-int  compressionDictList(client *c);
-int  compressionDictExport(client *c, uint32_t dict_id);
-int  compressionDictImport(client *c, const unsigned char *bytes, size_t len);
-int  compressionDictDrop(client *c, uint32_t dict_id);
+int compressionStatus(client *c);
+int compressionForceTrain(client *c);
+int compressionSweep(client *c, int direction /* 1 = compress, -1 = decompress */);
+int compressionDictList(client *c);
+int compressionDictExport(client *c, uint32_t dict_id);
+int compressionDictImport(client *c, const unsigned char *bytes, size_t len);
+int compressionDictDrop(client *c, uint32_t dict_id);
 
 /* ========================================================================
  * INFO

@@ -46,9 +46,9 @@ typedef struct ZSTD_DDict_s ZSTD_DDict;
 #define COMPRESSION_DICT_ID_NONE 0u
 
 typedef enum compressionDictState {
-    COMPRESSION_DICT_STATE_ACTIVE = 0,  /* current dict for new compressions */
-    COMPRESSION_DICT_STATE_RETIRING,    /* decompress-only, CDict may be NULL */
-    COMPRESSION_DICT_STATE_RETIRED,     /* scheduled for free; refcount == 0 */
+    COMPRESSION_DICT_STATE_ACTIVE = 0, /* current dict for new compressions */
+    COMPRESSION_DICT_STATE_RETIRING,   /* decompress-only, CDict may be NULL */
+    COMPRESSION_DICT_STATE_RETIRED,    /* scheduled for free; refcount == 0 */
 } compressionDictState;
 
 /*
@@ -68,14 +68,14 @@ typedef enum compressionDictState {
  *     with default seq_cst is fine for v1 (registry ops are not hot).
  */
 typedef struct compressionDictPair {
-    uint32_t             dict_id;
-    unsigned char       *bytes;
-    size_t               bytes_len;
-    ZSTD_CDict          *cdict;
-    ZSTD_DDict          *ddict;
-    atomic_size_t        refcount;
+    uint32_t dict_id;
+    unsigned char *bytes;
+    size_t bytes_len;
+    ZSTD_CDict *cdict;
+    ZSTD_DDict *ddict;
+    atomic_size_t refcount;
     compressionDictState state;
-    mstime_t             promoted_at_ms;
+    mstime_t promoted_at_ms;
 } compressionDictPair;
 
 /* ========================================================================

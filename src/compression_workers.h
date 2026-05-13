@@ -48,9 +48,9 @@
  * from §2.1 R2.1.3).
  */
 
-int  compressionWorkersStart(int n_threads);
+int compressionWorkersStart(int n_threads);
 void compressionWorkersStop(void);
-int  compressionWorkersResize(int n_threads);
+int compressionWorkersResize(int n_threads);
 
 /* ========================================================================
  * Candidate inbox (main thread → workers)

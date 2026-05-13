@@ -96,10 +96,10 @@ static inline bool rdbUseValkeyMagic(int rdbver) {
 /* When a length of a string object stored on disk has the first two bits
  * set, the remaining six bits specify a special encoding for the object
  * accordingly to the following defines: */
-#define RDB_ENC_INT8 0     /* 8 bit signed integer */
-#define RDB_ENC_INT16 1    /* 16 bit signed integer */
-#define RDB_ENC_INT32 2    /* 32 bit signed integer */
-#define RDB_ENC_LZF 3      /* string compressed with FASTLZ */
+#define RDB_ENC_INT8 0       /* 8 bit signed integer */
+#define RDB_ENC_INT16 1      /* 16 bit signed integer */
+#define RDB_ENC_INT32 2      /* 32 bit signed integer */
+#define RDB_ENC_LZF 3        /* string compressed with FASTLZ */
 #define RDB_ENC_COMPRESSED 4 /* string compressed with the inline-compression feature (reserved, unused in v1 feature-off) */
 
 /* Notes on RDB_ENC_COMPRESSED (see realtime-data-compression design §2.6 R2.6.1):

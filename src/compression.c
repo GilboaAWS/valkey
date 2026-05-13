@@ -108,28 +108,28 @@ static const char *kDisabledReply =
  * "disabled" because the feature is inert. */
 static sds compressionRenderFields(sds out) {
     return sdscatprintf(out,
-        "compression_enabled:0\r\n"
-        "compression_state:disabled\r\n"
-        "compression_active_dict_id:0\r\n"
-        "compression_known_dicts:0\r\n"
-        "compression_dict_cap_reached:0\r\n"
-        "compression_compressed_objects:0\r\n"
-        "compression_total_uncompressed_bytes:0\r\n"
-        "compression_total_compressed_bytes:0\r\n"
-        "compression_ratio:0\r\n"
-        "compression_live_ratio_10m:0\r\n"
-        "compression_net_saved_bytes:0\r\n"
-        "compression_candidates_pending:0\r\n"
-        "compression_candidates_dropped_total:0\r\n"
-        "compression_sweep_backpressure_total:0\r\n"
-        "compression_sweep_pacing_sleeps_total:0\r\n"
-        "compression_outbox_backpressure_total:0\r\n"
-        "compression_compressions_per_sec:0\r\n"
-        "compression_decompressions_per_sec:0\r\n"
-        "compression_skipped_incompressible:0\r\n"
-        "compression_training_last_duration_ms:0\r\n"
-        "compression_training_last_sample_count:0\r\n"
-        "compression_errors_total:0\r\n");
+                        "compression_enabled:0\r\n"
+                        "compression_state:disabled\r\n"
+                        "compression_active_dict_id:0\r\n"
+                        "compression_known_dicts:0\r\n"
+                        "compression_dict_cap_reached:0\r\n"
+                        "compression_compressed_objects:0\r\n"
+                        "compression_total_uncompressed_bytes:0\r\n"
+                        "compression_total_compressed_bytes:0\r\n"
+                        "compression_ratio:0\r\n"
+                        "compression_live_ratio_10m:0\r\n"
+                        "compression_net_saved_bytes:0\r\n"
+                        "compression_candidates_pending:0\r\n"
+                        "compression_candidates_dropped_total:0\r\n"
+                        "compression_sweep_backpressure_total:0\r\n"
+                        "compression_sweep_pacing_sleeps_total:0\r\n"
+                        "compression_outbox_backpressure_total:0\r\n"
+                        "compression_compressions_per_sec:0\r\n"
+                        "compression_decompressions_per_sec:0\r\n"
+                        "compression_skipped_incompressible:0\r\n"
+                        "compression_training_last_duration_ms:0\r\n"
+                        "compression_training_last_sample_count:0\r\n"
+                        "compression_errors_total:0\r\n");
 }
 
 int compressionStatus(client *c) {
@@ -200,8 +200,7 @@ void compressionCommand(client *c) {
             "Note: compression is in Phase 0 (skeleton). Additional",
             "subcommands (DICT LIST/DROP/EXPORT/IMPORT, SWEEP, TRAIN,",
             "ENABLE, DISABLE) land in Phase 1.",
-            NULL
-        };
+            NULL};
         addReplyHelp(c, help);
     } else {
         addReplySubcommandSyntaxError(c);
