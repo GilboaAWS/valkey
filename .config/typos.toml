@@ -6,6 +6,10 @@ extend-exclude = [
     "deps/",
     # crc16_slottable is primarily pre-generated random strings.
     "src/crc16_slottable.c",
+    # Frozen PR-review audit trail (quotes reviewer text verbatim; editing
+    # would rewrite history). These are planning artifacts, not shipped.
+    ".agents/planning/realtime-data-compression/DESIGN_TODO.md",
+    ".agents/planning/realtime-data-compression/pr-feedback.json",
 ]
 ignore-hidden = false
 

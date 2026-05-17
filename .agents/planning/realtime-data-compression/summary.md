@@ -69,7 +69,7 @@ Per-thread rationale: [`DESIGN_TODO.md`](DESIGN_TODO.md). GitHub PR with posted 
 See [`implementation/plan.md`](implementation/plan.md) for the full sequenced plan. Top-level shape:
 
 - **7 subsystems** with narrow interface contracts. @ikolomi owns the concurrency-critical pieces (S1 dict lifecycle, S2 hot path + COW audit). @GilboaAWS owns persistence (S3), observability (S4), benchmarks (S5), integration tests (S6), and dev infra (S7).
-- **Phase 0** (week 1): land compileable skeleton with stubbed public APIs + interface contracts. Joint PR.
+- **Phase 0** (week 1): land compilable skeleton with stubbed public APIs + interface contracts. Joint PR.
 - **Phase 1** (weeks 2–5): parallel implementation of all subsystems; end-of-phase gate is a working single-instance demo.
 - **Phase 2** (weeks 6–9): integration + COW audit + full §7.5 benchmark run.
 - **Phase 3** (weeks 10–11): stabilize, doc, release prep.

@@ -42,7 +42,7 @@ Each subsystem is owned end-to-end — code + unit tests ship in the same PR. De
 
 ## 4. Interface contracts (Phase 0 deliverable)
 
-All inter-subsystem interactions go through these contracts. Phase 0 lands **compileable skeleton headers** with stubs returning sensible defaults (NULL dicts, pass-through encoders). No subsystem builds against another's internal state.
+All inter-subsystem interactions go through these contracts. Phase 0 lands **compilable skeleton headers** with stubs returning sensible defaults (NULL dicts, pass-through encoders). No subsystem builds against another's internal state.
 
 ### 4.1 `compression.h` — public API surface (owned: S2)
 
@@ -99,18 +99,19 @@ From §5.3:
 
 ```
 RDB per-value encoding for compressed STRING:
-  byte 0:    RDB_ENC_ZSTDDICT         (new; chosen value reserved in Phase 0)
-  varint:    dict_id
+  byte 0:    RDB_ENC_COMPRESSED       (new; chosen value reserved in Phase 0)
+  varint:    alg_magic                (algorithm tag, e.g. ASCII "ZSTD")
+  varint:    alg_meta                 (per-alg: ZSTD uses dict_id)
   varint:    uncompressed_size
   varint:    compressed_size
   bytes:     compressed payload
 
-RDB AUX for dictionary bytes (one entry per dict alive at save):
+RDB AUX for dictionary bytes (ZSTD algorithm only — one entry per dict alive at save):
   aux key:   "compression-dict-<dict_id>"
   aux value: raw dict bytes (max compression-dict-size; default 100 KB)
 ```
 
-S2 owns **header encode/decode** inside `src/compression_header.c` — callable from S3's `rdb.c`. S3 owns **RDB stream format** (varints, AUX entries, save/load orchestration). S3 must call `compressionRegistryLookup(dict_id)` during load and reject frames referencing an unknown dict with a clear error (R2.6.5).
+S2 owns **header encode/decode** inside `src/compression_header.c` — callable from S3's `rdb.c`. S3 owns **RDB stream format** (varints, AUX entries, save/load orchestration). On load, S3 must reject frames whose `alg_magic` is unknown, and for ZSTD-magic frames must call `compressionRegistryLookup(alg_meta)` and reject frames referencing an unknown dict with a clear error (R2.6.5).
 
 ### 4.4 Queue primitives contract — S1 ↔ S2
 
@@ -151,7 +152,7 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] S7: add `deps/zstd/` vendored build + `BUILD_ZSTD` flag, wire into Makefile + CMake. Add CI matrix entry.
 - [ ] S2: create `src/compression.{c,h}` + `src/compression_registry.{c,h}` + `src/compression_header.{c,h}` + `src/compression_workers.{c,h}` + `src/compression_train.{c,h}` stubs. All public APIs return "feature-disabled" defaults.
 - [ ] S4: register 16 config knobs (5 primary + 11 advanced) per §2.12, stubbed to no-op. Add `COMPRESSION` command tree with `STATUS`-only implementation.
-- [ ] S3: reserve `RDB_ENC_ZSTDDICT` enum value; document it in `src/rdb.h`.
+- [ ] S3: reserve `RDB_ENC_COMPRESSED` enum value; document it in `src/rdb.h`.
 - [ ] S6: add empty test fixture `tests/unit/type/compression.tcl` that verifies feature-off is identical to current behavior.
 - [ ] Joint sign-off on interface contracts §4.1–4.6 of this doc.
 
@@ -183,7 +184,7 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S5.2 — Canonical scenarios harness**: the six scenarios in §7.5 (uniform large, skewed JSON, time-series, etc.) as reproducible runs.
 - [ ] **S5.3 — Perf dashboard**: extend Valkey performance dashboard or add a feature-scoped one showing baseline-vs-compressed per scenario. Publish to `perf-dashboard.valkey.io` infrastructure.
 - [ ] **S7.2 — CI — long-running perf regression**: nightly job running §7.3 under AddressSanitizer + ThreadSanitizer.
-- [ ] **S3.1 — RDB encode path**: new `RDB_ENC_ZSTDDICT` marker, varint-encoded dict_id/sizes, AUX entries for dictionaries. Implements R2.6.1–R2.6.4.
+- [ ] **S3.1 — RDB encode path**: new `RDB_ENC_COMPRESSED` marker, varint-encoded alg_magic/alg_meta/sizes, AUX entries for dictionaries (ZSTD). Implements R2.6.1–R2.6.4.
 - [ ] **S3.2 — RDB decode path**: lookup dict by id, rehydrate `OBJ_ENCODING_COMPRESSED` robj. Unknown-dict error path per R2.6.5.
 - [ ] **S3.3 — Full-sync RDB uncompressed flag**: implements R2.6.8 (new this walkthrough) — full-sync RDB always emits uncompressed regardless of `compression-enabled` state. Disk RDB still compressed.
 - [ ] **S3.4 — AOF**: compressed values serialized as their uncompressed command forms (`SET key value`). R2.7.

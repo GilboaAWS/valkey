@@ -375,6 +375,19 @@ ifeq ($(BUILD_TLS),module)
 	TLS_MODULE_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS) -DBUILD_TLS_MODULE=$(BUILD_MODULE)
 endif
 
+# Real-time compression feature (BUILD_ZSTD=yes by default).
+# When BUILD_ZSTD=yes the compression.c stubs are compiled into
+# valkey-server as ordinary .o files (Phase 0 — no ZSTD linkage yet).
+# When BUILD_ZSTD=no the USE_ZSTD macro is not defined; the stubs
+# continue to compile (they do not call any ZSTD APIs in Phase 0)
+# but Phase 1 code that relies on ZSTD will compile out.
+# See .agents/planning/realtime-data-compression/implementation/plan.md §5.
+BUILD_ZSTD ?= yes
+ifeq ($(BUILD_ZSTD),yes)
+	FINAL_CFLAGS+=-DUSE_ZSTD=$(BUILD_YES)
+	# Phase 1 will append: FINAL_LIBS += ../deps/zstd/lib/libzstd.a
+endif
+
 RDMA_LIBS=
 RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
 ifeq ($(RDMA_PKGCONFIG),0)
@@ -488,6 +501,11 @@ ENGINE_SERVER_OBJ = \
     cluster_slot_stats.o \
     commandlog.o \
     commands.o \
+    compression.o \
+    compression_header.o \
+    compression_registry.o \
+    compression_train.o \
+    compression_workers.o \
     config.o \
     connection.o \
     crc16.o \

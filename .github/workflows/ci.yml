@@ -54,6 +54,25 @@ jobs:
         run: |
           make test-unit
 
+  # Build with BUILD_ZSTD=no to exercise the compression feature-off path.
+  # Phase 0 skeleton: the compression code compiles either way (no zstd
+  # linkage yet). This matrix cell guards against Phase 1 regressions
+  # that accidentally make BUILD_ZSTD=yes a hard requirement.
+  # See .agents/planning/realtime-data-compression/implementation/plan.md §4.6.
+  test-ubuntu-latest-compression-off:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: make BUILD_ZSTD=no
+        run: |
+          sudo apt-get install pkg-config
+          make -j4 BUILD_ZSTD=no SERVER_CFLAGS='-Werror'
+      - name: test compression fixture
+        run: |
+          sudo apt-get install tcl8.6 tclx
+          ./runtest --single unit/type/compression --dump-logs
+
   test-ubuntu-latest-compatibility:
     runs-on: ubuntu-latest
     strategy:

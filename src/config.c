@@ -3513,6 +3513,29 @@ standardConfig static_configs[] = {
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
 
+    /* =========================================================
+     * Real-time data compression knobs (design/detailed-design.md §2.12).
+     * Phase 0: parsed and validated but feature-off has no effect.
+     * =========================================================
+     * Primary knobs (5) */
+    createBoolConfig("compression-enabled", NULL, MODIFIABLE_CONFIG, server.compression_enabled, 0, NULL, NULL),
+    createIntConfig("compression-threads", NULL, MODIFIABLE_CONFIG, 0, 16, server.compression_threads, 1, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("compression-min-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_min_value_size, 256, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("compression-max-value-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_max_value_size, 131072, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("compression-dict-size", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.compression_dict_size, 102400, MEMORY_CONFIG, NULL, NULL),
+    /* Advanced knobs (11) */
+    createIntConfig("compression-sweep-max-cpu-pct", NULL, MODIFIABLE_CONFIG, 1, 100, server.compression_sweep_max_cpu_pct, 25, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("compression-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.compression_cpulist, NULL, NULL, NULL),
+    createIntConfig("compression-min-savings-ratio", NULL, MODIFIABLE_CONFIG, 0, 100, server.compression_min_savings_ratio, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-retry-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_retry_interval, 3600, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-lfu-threshold", NULL, MODIFIABLE_CONFIG, 0, 255, server.compression_lfu_threshold, 5, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-min-idle-seconds", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_min_idle_seconds, 60, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-settle-seconds", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_settle_seconds, 60, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-dict-first-training-keys-count", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_dict_first_training_keys_count, 10000, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-dict-drift-ratio", NULL, MODIFIABLE_CONFIG, 0, 100, server.compression_dict_drift_ratio, 70, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-dict-refresh-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.compression_dict_refresh_interval, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("compression-dict-max-versions", NULL, MODIFIABLE_CONFIG, 2, 16, server.compression_dict_max_versions, 4, INTEGER_CONFIG, NULL, NULL),
+
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
     {NULL},
 };

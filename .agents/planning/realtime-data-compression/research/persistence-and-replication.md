@@ -69,8 +69,10 @@ We want the RDB to preserve compressed values **without decompressing and re-com
 Add a new special marker alongside `RDB_ENC_LZF`:
 
 ```c
-#define RDB_ENC_LZF      3   /* existing */
-#define RDB_ENC_ZSTDDICT 4   /* new: ZSTD frame referencing a registered dictID */
+#define RDB_ENC_LZF        3   /* existing */
+#define RDB_ENC_COMPRESSED 4   /* new: compressed frame with an algorithm tag
+                                  identifying the backend (ZSTD+dict in v1;
+                                  reserved for LZ4, snappy, etc. in v2+) */
 ```
 
 Layout of a `ZSTDDICT`-encoded string on disk:
@@ -92,7 +94,7 @@ Before the first compressed value is emitted, we need to persist the dictionary 
 - **Option A: new AUX opcode.** RDB already has an opcode for arbitrary aux key/value pairs (`RDB_OPCODE_AUX`). We emit one aux entry per dictionary: key = `"compression-dict-<N>"`, value = dictionary bytes. The loader sees these, re-builds DDicts, and is ready to decode frames with that dictID. Zero new opcode numbers needed; maximum compatibility.
 - **Option B: dedicated new opcode** (e.g., `RDB_OPCODE_COMPRESSION_DICT`). Cleaner but requires a version bump and a loader change. Older loaders would fail on the new opcode.
 
-**Preferred: Option A** — aux entries can be ignored by older loaders (they simply skip unknown aux pairs), which gives us forward compatibility for the dictionary payload. The `RDB_ENC_ZSTDDICT` marker itself is the hard dependency; RDBs containing it are unreadable by pre-feature versions.
+**Preferred: Option A** — aux entries can be ignored by older loaders (they simply skip unknown aux pairs), which gives us forward compatibility for the dictionary payload. The `RDB_ENC_COMPRESSED` marker itself is the hard dependency; RDBs containing it are unreadable by pre-feature versions.
 
 ### RDB version bump?
 
@@ -129,7 +131,7 @@ graph TB
     RESP[RESP to clients, replicas, AOF]
   end
   subgraph Disk[RDB — compressed allowed]
-    RDBENC[RDB_ENC_ZSTDDICT + AUX dictionary]
+    RDBENC[RDB_ENC_COMPRESSED + AUX dictionary]
   end
   subgraph Memory[In-memory — compressed allowed]
     ROBJ[robj with OBJ_ENCODING_COMPRESSED]

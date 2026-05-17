@@ -66,12 +66,12 @@ If a Valkey server has `compression-enabled no` and is asked to load an RDB that
 
 **Context.** The on-disk RDB will contain:
 - One or more `RDB_OPCODE_AUX` entries carrying dictionary bytes (`"compression-dict-<N>"`).
-- One or more values encoded with the new `RDB_ENC_ZSTDDICT` marker.
+- One or more values encoded with the new `RDB_ENC_COMPRESSED` marker.
 
 The server can either:
 
 1. **Fail loud**: refuse to load, log a clear error pointing the operator at `compression-enabled` or a migration tool. Simple, safe, but operationally harsh (an operator who "just wanted to turn the feature off" now has a server that won't start).
-2. **Transparently decompress on load** (my recommendation): when the loader sees `RDB_ENC_ZSTDDICT`, it initializes the needed `ZSTD_DDict` handle from the dictionary bytes stored in the preceding AUX entries (via `ZSTD_createDDict()` — the dictionary itself is already on disk, not retrained), decompresses each value, and stores it uncompressed in memory. The dictionaries stay in the registry but no new writes are compressed. Operator can later re-enable compression without data loss.
+2. **Transparently decompress on load** (my recommendation): when the loader sees `RDB_ENC_COMPRESSED`, it initializes the needed `ZSTD_DDict` handle from the dictionary bytes stored in the preceding AUX entries (via `ZSTD_createDDict()` — the dictionary itself is already on disk, not retrained), decompresses each value, and stores it uncompressed in memory. The dictionaries stay in the registry but no new writes are compressed. Operator can later re-enable compression without data loss.
 3. **Hybrid**: load compressed values compressed even though the feature is disabled, so that if the operator re-enables compression they don't pay a re-compression sweep. But new writes are never compressed. Most flexible, slightly more code.
 
 **Additional dimension: missing dictionary**. If a value references a `dictID` for which no dictionary was emitted (corrupt or truncated RDB), that's always an error regardless of which option we pick. `rdb-version-check` already has a `strict`/`relaxed` enum — we can reuse that knob if needed.
@@ -84,7 +84,7 @@ The server can either:
 
 **Answer:** Option 2 — **transparently decompress on load**.
 
-- When the loader encounters `RDB_ENC_ZSTDDICT` while `compression-enabled no`, it initializes the needed `ZSTD_DDict` handle from the dictionary bytes stored in the preceding AUX entries (via `ZSTD_createDDict()` — the dictionary itself is already on disk, not retrained), decompresses each value inline, and stores the result uncompressed.
+- When the loader encounters `RDB_ENC_COMPRESSED` while `compression-enabled no`, it initializes the needed `ZSTD_DDict` handle from the dictionary bytes stored in the preceding AUX entries (via `ZSTD_createDDict()` — the dictionary itself is already on disk, not retrained), decompresses each value inline, and stores the result uncompressed.
 - Dictionaries loaded this way are discarded after load (not kept in the registry) — no new writes are compressed.
 - If a compressed value references a `dictID` that was never emitted, the RDB is rejected as corrupt regardless of the `compression-enabled` setting (same rule that applies when the feature is enabled).
 - Consequence: toggling `compression-enabled` off is safe and reversible — operators can turn the feature on/off without data loss at any time.
@@ -503,7 +503,7 @@ Lifted from `research/persistence-and-replication.md` and confirmed:
 - **Replication feed** (`feedReplicationBufferWithObject` in `src/replication.c`): route every `robj` through `objectGetUncompressedView(o, &scratch)` before copying bytes into the backlog. Wire stays uncompressed RESP. No replica-side awareness of compression needed. Cross-version replication unaffected.
 - **AOF writer**: same helper, same contract. AOF log is uncompressed RESP.
 - **`DUMP` / `RESTORE` / `MIGRATE`**: for v1, decompress before serializing the RDB chunk. Compressed-in-place migration (ship the dict prelude within the chunk) is a v2 optimization. Trade-off accepted: migration pays a decompression cost in exchange for not having to move dictionary bytes across node boundaries.
-- **RDB on-disk**: compressed with the new `RDB_ENC_ZSTDDICT` marker, with dictionary bytes written as `RDB_OPCODE_AUX` entries before the first compressed value. Bump `RDB_VERSION` so pre-feature loaders refuse the file cleanly. See `research/persistence-and-replication.md` for the layout.
+- **RDB on-disk**: compressed with the new `RDB_ENC_COMPRESSED` marker (algorithm tag + per-algorithm metadata in the payload), with dictionary bytes written as `RDB_OPCODE_AUX` entries before the first compressed value. Bump `RDB_VERSION` so pre-feature loaders refuse the file cleanly. See `research/persistence-and-replication.md` for the layout.
 
 Implementation note: `objectGetUncompressedView()` must reuse its scratch sds buffer (thread-local or caller-owned) to avoid per-write allocator churn on the replication feed path.
 
