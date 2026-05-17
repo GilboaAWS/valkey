@@ -19,8 +19,8 @@
 
 | Engineer | Role | Subsystems |
 |---|---|---|
-| **@ikolomi** | Lead engineer | S1, S2 (concurrency-critical, COW audit owner) |
-| **@GilboaAWS** | Co-owner | S3, S4, S5, S6, S7 |
+| **@ikolomi** | Lead engineer | S2, S6 (concurrency-critical, COW audit owner) |
+| **@GilboaAWS** | Co-owner | S1, S3, S4, S5, S7 |
 
 Code reviews: each engineer reviews the other's PRs. Design divergences from `detailed-design.md` require agreement from both.
 
@@ -30,12 +30,12 @@ Each subsystem is owned end-to-end — code + unit tests ship in the same PR. De
 
 | # | Subsystem | Files (from §4.1) | R-refs | Owner | Effort |
 |---|---|---|---|---|---|
-| **S1** | Dictionary lifecycle (registry, training, promotion, retirement, drift-retrain, main-thread iteration + sample copy, bio train job) | `src/compression_registry.c`, `src/compression_train.c` | R2.3.1–R2.3.12, R2.11.4 | @ikolomi | L |
+| **S1** | Dictionary lifecycle (registry, training, promotion, retirement, drift-retrain, main-thread iteration + sample copy, bio train job) | `src/compression_registry.c`, `src/compression_train.c` | R2.3.1–R2.3.12, R2.11.4 | @GilboaAWS | L |
 | **S2** | Compression hot path (eligibility predicate, worker pool, encoder, decoder, write/read hooks, incompressible-keys hashtable, sweep pacing) | `src/compression.c`/`.h`, `src/compression_workers.c`, `src/compression_header.c` + `db.c` hook points | R2.1, R2.2, R2.4, R2.5, R2.11 | @ikolomi | L |
 | **S3** | Persistence — RDB format extension + AOF behavior + full-sync RDB uncompressed | `src/rdb.c`, `src/aof.c`, `src/replication.c` (full-sync flag) | R2.6.1–R2.6.9, R2.7 | @GilboaAWS | M |
 | **S4** | Observability & admin (`INFO compression`, `COMPRESSION` command family, latency monitor, telemetry) | `src/compression.c` (`infoCompression`), `src/commands/compression-*.json` | R2.8, R2.9, R2.10 | @GilboaAWS | S |
 | **S5** | Benchmark suite + perf validation (extend `valkey-benchmark`, canonical scenarios, perf dashboard, regression harness) | `src/valkey-benchmark.c` extensions, `tests/perf/` | §7.3, §7.5 | @GilboaAWS | L |
-| **S6** | Integration tests — COW invariant merge-blocker, end-to-end, replication, RDB round-trip, soak | `tests/unit/type/compression.tcl`, `tests/unit/compression-cow-invariant.tcl`, `tests/integration/compression/` | §7.2 | @GilboaAWS | M |
+| **S6** | Integration tests — COW invariant merge-blocker, end-to-end, replication, RDB round-trip, soak | `tests/unit/type/compression.tcl`, `tests/unit/compression-cow-invariant.tcl`, `tests/integration/compression/` | §7.2 | @ikolomi | M |
 | **S7** | Dev infra — build flags (`USE_ZSTD`), CI jobs, unit test scaffolding (gtest), `deps/zstd/` vendored bump if needed | `src/Makefile`, `.github/workflows/*`, `deps/zstd/` | §7.1 | @GilboaAWS | S |
 
 **Effort legend:** S ≤ 1 week · M ≈ 2–3 weeks · L ≈ 4+ weeks of focused work.
@@ -149,21 +149,17 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 
 **Exit criteria:** feature compiles with `BUILD_ZSTD=yes`, new config knobs parse, `COMPRESSION STATUS` returns "disabled", zero behavior change (feature defaults off).
 
-- [ ] S7: add `deps/zstd/` vendored build + `BUILD_ZSTD` flag, wire into Makefile + CMake. Add CI matrix entry.
-- [ ] S2: create `src/compression.{c,h}` + `src/compression_registry.{c,h}` + `src/compression_header.{c,h}` + `src/compression_workers.{c,h}` + `src/compression_train.{c,h}` stubs. All public APIs return "feature-disabled" defaults.
-- [ ] S4: register 16 config knobs (5 primary + 11 advanced) per §2.12, stubbed to no-op. Add `COMPRESSION` command tree with `STATUS`-only implementation.
-- [ ] S3: reserve `RDB_ENC_COMPRESSED` enum value; document it in `src/rdb.h`.
-- [ ] S6: add empty test fixture `tests/unit/type/compression.tcl` that verifies feature-off is identical to current behavior.
-- [ ] Joint sign-off on interface contracts §4.1–4.6 of this doc.
+- [x] S7: add `deps/zstd/` vendored build + `BUILD_ZSTD` flag, wire into Makefile + CMake. Add CI matrix entry. *(PR #3 — `phase-0-skeleton`, merged 2026-05-17)*
+- [x] S2: create `src/compression.{c,h}` + `src/compression_registry.{c,h}` + `src/compression_header.{c,h}` + `src/compression_workers.{c,h}` + `src/compression_train.{c,h}` stubs. All public APIs return "feature-disabled" defaults. *(PR #3)*
+- [x] S4: register 16 config knobs (5 primary + 11 advanced) per §2.12, stubbed to no-op. Add `COMPRESSION` command tree with `STATUS`-only implementation. *(PR #3)*
+- [x] S3: reserve `RDB_ENC_COMPRESSED` enum value; document it in `src/rdb.h`. *(PR #3)*
+- [x] S6: add empty test fixture `tests/unit/type/compression.tcl` that verifies feature-off is identical to current behavior. *(PR #3)*
+- [x] Joint sign-off on interface contracts §4.1–4.6 of this doc. *(PR #3 merged — contracts accepted)*
 
 ### Phase 1 — Core subsystems offline (4 weeks, parallel)
 
-#### @ikolomi track (S1 + S2)
+#### @ikolomi track (S2)
 
-- [ ] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior.
-- [ ] **S1.2 — Training sampler (main thread)**: kvstore shard iteration + contiguous-buffer sample copy, spliced across `serverCron` ticks. Implements R2.3.6 corrected flow (per Thread #29). `LOOKUP_NOTOUCH` semantics.
-- [ ] **S1.3 — Bio train job (`BIO_COMPRESSION_TRAIN`)**: accepts `(buffer, sizes[], count)`, calls `ZDICT_trainFromBuffer`, signals completion via event fd. Never touches `robj`/`kvstore`/refcounts.
-- [ ] **S1.4 — Train completion + promotion on main thread**: creates `ZSTD_CDict`/`ZSTD_DDict`, inserts into registry, atomic promotion. Implements R2.3.5 drift-retrain trigger detection.
 - [ ] **S2.1 — Header encode/decode** (`compression_header.c`): round-trip tests, malformed-header rejection (R2.5.3). Allocation helpers for `OBJ_ENCODING_COMPRESSED` robjs.
 - [ ] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), `write_age`, `idle_seconds`, LFU-freq guard (only when LFU policy active), incompressible-keys hashtable check.
 - [ ] **S2.3 — Incompressible-keys hashtable**: dict-ID scoped primary + time fallback. Implements Thread #20 resolution.
@@ -175,8 +171,12 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S2.9 — Master switch + sweep**: `COMPRESSION SWEEP [ASYNC]` triggers; runtime toggle drains safely (pattern from Thread #11).
 - [ ] **S2.10 — Cron integration**: `compressionCron` called from `serverCron`; sweep pacing; dict drift-ratio evaluation.
 
-#### @GilboaAWS track (S3/S4/S5/S7)
+#### @GilboaAWS track (S1/S3/S4/S5/S7)
 
+- [ ] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior.
+- [ ] **S1.2 — Training sampler (main thread)**: kvstore shard iteration + contiguous-buffer sample copy, spliced across `serverCron` ticks. Implements R2.3.6 corrected flow (per Thread #29). `LOOKUP_NOTOUCH` semantics.
+- [ ] **S1.3 — Bio train job (`BIO_COMPRESSION_TRAIN`)**: accepts `(buffer, sizes[], count)`, calls `ZDICT_trainFromBuffer`, signals completion via event fd. Never touches `robj`/`kvstore`/refcounts.
+- [ ] **S1.4 — Train completion + promotion on main thread**: creates `ZSTD_CDict`/`ZSTD_DDict`, inserts into registry, atomic promotion. Implements R2.3.5 drift-retrain trigger detection.
 - [ ] **S4.1 — `INFO compression` section**: all fields per R2.10 + §5.6. Unit tests for schema stability.
 - [ ] **S4.2 — `COMPRESSION` command tree full implementation**: `STATUS`, `DICT LIST`, `DICT DROP`, `SWEEP`, `DEBUG`. Reply-schema tests per §7.4.
 - [ ] **S4.3 — Latency monitor events** per R2.10 (train start/finish, worker stall, etc.)
@@ -199,19 +199,22 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 
 #### @ikolomi track
 
-- [ ] **S1.5 — Drift-retrain end-to-end**: `compression-dict-drift-ratio` trigger → new train run → promotion → old dict retirement. Integration test covers full lifecycle.
 - [ ] **S2.11 — Edge cases**: OOM during compress, worker crash recovery (R2.7 § 6.7), sweep-during-shutdown, dict-cap reached.
 - [ ] **S2.12 — Module API DMA on compressed keys**: coordinate with S6.1 test module.
 - [ ] **S2.13 — COW audit pass 1**: walk every mutating code path (t_string.c, bitops.c, module.c, debug.c) per R2.4.5 audit checklist. File CR as merge-blocker review.
 
 #### @GilboaAWS track
 
+- [ ] **S1.5 — Drift-retrain end-to-end**: `compression-dict-drift-ratio` trigger → new train run → promotion → old dict retirement. Integration test covers full lifecycle.
+- [ ] **S5.4 — Full §7.5 benchmark run**: all 6 scenarios × baseline/enabled-sync/enabled-off. Publish results.
+- [ ] **S3.5 — `MEMORY USAGE` + `maxmemory` accounting** for compressed robjs per R2.8.
+
+#### @ikolomi track (S6)
+
 - [ ] **S6.1 — COW invariant Tcl test** (`compression-cow-invariant.tcl`): runs every mutating command against a live compression job in parallel; asserts no corruption. **Merge blocker.** (§7.2)
 - [ ] **S6.2 — Replication integration tests**: full-sync with R2.6.8 uncompressed RDB, PSYNC correctness, mixed-version primary/replica.
 - [ ] **S6.3 — RDB round-trip stress**: save with many dicts, corrupt various fields, verify error detection (R2.6.5).
 - [ ] **S6.4 — `CLUSTER SLOTS` / `MIGRATE` under compression**: ensures no hidden read path bypasses `objectGetUncompressedView`.
-- [ ] **S5.4 — Full §7.5 benchmark run**: all 6 scenarios × baseline/enabled-sync/enabled-off. Publish results.
-- [ ] **S3.5 — `MEMORY USAGE` + `maxmemory` accounting** for compressed robjs per R2.8.
 
 **End of Phase 2 gate:**
 - All integration tests green.
