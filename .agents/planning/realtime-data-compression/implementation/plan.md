@@ -19,8 +19,8 @@
 
 | Engineer | Role | Subsystems |
 |---|---|---|
-| **@ikolomi** | Lead engineer | S2, S6 (concurrency-critical, COW audit owner) |
-| **@GilboaAWS** | Co-owner | S1, S3, S4, S5, S7 |
+| **@ikolomi** | Lead engineer | S2, S5 (concurrency-critical, COW audit owner) |
+| **@GilboaAWS** | Co-owner | S1, S3, S4, S6, S7 |
 
 Code reviews: each engineer reviews the other's PRs. Design divergences from `detailed-design.md` require agreement from both.
 
@@ -34,8 +34,8 @@ Each subsystem is owned end-to-end — code + unit tests ship in the same PR. De
 | **S2** | Compression hot path (eligibility predicate, worker pool, encoder, decoder, write/read hooks, incompressible-keys hashtable, sweep pacing) | `src/compression.c`/`.h`, `src/compression_workers.c`, `src/compression_header.c` + `db.c` hook points | R2.1, R2.2, R2.4, R2.5, R2.11 | @ikolomi | L |
 | **S3** | Persistence — RDB format extension + AOF behavior + full-sync RDB uncompressed | `src/rdb.c`, `src/aof.c`, `src/replication.c` (full-sync flag) | R2.6.1–R2.6.9, R2.7 | @GilboaAWS | M |
 | **S4** | Observability & admin (`INFO compression`, `COMPRESSION` command family, latency monitor, telemetry) | `src/compression.c` (`infoCompression`), `src/commands/compression-*.json` | R2.8, R2.9, R2.10 | @GilboaAWS | S |
-| **S5** | Benchmark suite + perf validation (extend `valkey-benchmark`, canonical scenarios, perf dashboard, regression harness) | `src/valkey-benchmark.c` extensions, `tests/perf/` | §7.3, §7.5 | @GilboaAWS | L |
-| **S6** | Integration tests — COW invariant merge-blocker, end-to-end, replication, RDB round-trip, soak | `tests/unit/type/compression.tcl`, `tests/unit/compression-cow-invariant.tcl`, `tests/integration/compression/` | §7.2 | @ikolomi | M |
+| **S5** | Benchmark suite + perf validation (extend `valkey-benchmark`, canonical scenarios, perf dashboard, regression harness) | `src/valkey-benchmark.c` extensions, `tests/perf/` | §7.3, §7.5 | @ikolomi | L |
+| **S6** | Integration tests — COW invariant merge-blocker, end-to-end, replication, RDB round-trip, soak | `tests/unit/type/compression.tcl`, `tests/unit/compression-cow-invariant.tcl`, `tests/integration/compression/` | §7.2 | @GilboaAWS | M |
 | **S7** | Dev infra — build flags (`USE_ZSTD`), CI jobs, unit test scaffolding (gtest), `deps/zstd/` vendored bump if needed | `src/Makefile`, `.github/workflows/*`, `deps/zstd/` | §7.1 | @GilboaAWS | S |
 
 **Effort legend:** S ≤ 1 week · M ≈ 2–3 weeks · L ≈ 4+ weeks of focused work.
@@ -158,7 +158,7 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 
 ### Phase 1 — Core subsystems offline (4 weeks, parallel)
 
-#### @ikolomi track (S2)
+#### @ikolomi track (S2/S5)
 
 - [ ] **S2.1 — Header encode/decode** (`compression_header.c`): round-trip tests, malformed-header rejection (R2.5.3). Allocation helpers for `OBJ_ENCODING_COMPRESSED` robjs.
 - [ ] **S2.2 — Eligibility predicate** (`compressionIsEligible`): implements R2.2 consolidated predicate — size bounds, encoding filter (EMBSTR excluded), `write_age`, `idle_seconds`, LFU-freq guard (only when LFU policy active), incompressible-keys hashtable check.
@@ -170,8 +170,11 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S2.8 — Read-path hook**: `lookupKey*` helper returns uncompressed view. Touches all command handlers that read bytes.
 - [ ] **S2.9 — Master switch + sweep**: `COMPRESSION SWEEP [ASYNC]` triggers; runtime toggle drains safely (pattern from Thread #11).
 - [ ] **S2.10 — Cron integration**: `compressionCron` called from `serverCron`; sweep pacing; dict drift-ratio evaluation.
+- [ ] **S5.1 — `valkey-benchmark` extensions**: `--value-size-distribution`, `--value-data`, `--key-distribution` flags per §7.5.
+- [ ] **S5.2 — Canonical scenarios harness**: the six scenarios in §7.5 (uniform large, skewed JSON, time-series, etc.) as reproducible runs.
+- [ ] **S5.3 — Perf dashboard**: extend Valkey performance dashboard or add a feature-scoped one showing baseline-vs-compressed per scenario. Publish to `perf-dashboard.valkey.io` infrastructure.
 
-#### @GilboaAWS track (S1/S3/S4/S5/S7)
+#### @GilboaAWS track (S1/S3/S4/S6/S7)
 
 - [ ] **S1.1 — Dictionary registry** (`compression_registry.c`): add/lookup/promote/retire, refcounting, cap enforcement. Unit tests covering every branch of R2.3.9 promotion + R2.3.10 retirement. Owns `compression-max-dict-cap` behavior.
 - [ ] **S1.2 — Training sampler (main thread)**: kvstore shard iteration + contiguous-buffer sample copy, spliced across `serverCron` ticks. Implements R2.3.6 corrected flow (per Thread #29). `LOOKUP_NOTOUCH` semantics.
@@ -180,9 +183,6 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S4.1 — `INFO compression` section**: all fields per R2.10 + §5.6. Unit tests for schema stability.
 - [ ] **S4.2 — `COMPRESSION` command tree full implementation**: `STATUS`, `DICT LIST`, `DICT DROP`, `SWEEP`, `DEBUG`. Reply-schema tests per §7.4.
 - [ ] **S4.3 — Latency monitor events** per R2.10 (train start/finish, worker stall, etc.)
-- [ ] **S5.1 — `valkey-benchmark` extensions**: `--value-size-distribution`, `--value-data`, `--key-distribution` flags per §7.5.
-- [ ] **S5.2 — Canonical scenarios harness**: the six scenarios in §7.5 (uniform large, skewed JSON, time-series, etc.) as reproducible runs.
-- [ ] **S5.3 — Perf dashboard**: extend Valkey performance dashboard or add a feature-scoped one showing baseline-vs-compressed per scenario. Publish to `perf-dashboard.valkey.io` infrastructure.
 - [ ] **S7.2 — CI — long-running perf regression**: nightly job running §7.3 under AddressSanitizer + ThreadSanitizer.
 - [ ] **S3.1 — RDB encode path**: new `RDB_ENC_COMPRESSED` marker, varint-encoded alg_magic/alg_meta/sizes, AUX entries for dictionaries (ZSTD). Implements R2.6.1–R2.6.4.
 - [ ] **S3.2 — RDB decode path**: lookup dict by id, rehydrate `OBJ_ENCODING_COMPRESSED` robj. Unknown-dict error path per R2.6.5.
@@ -202,15 +202,12 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S2.11 — Edge cases**: OOM during compress, worker crash recovery (R2.7 § 6.7), sweep-during-shutdown, dict-cap reached.
 - [ ] **S2.12 — Module API DMA on compressed keys**: coordinate with S6.1 test module.
 - [ ] **S2.13 — COW audit pass 1**: walk every mutating code path (t_string.c, bitops.c, module.c, debug.c) per R2.4.5 audit checklist. File CR as merge-blocker review.
+- [ ] **S5.4 — Full §7.5 benchmark run**: all 6 scenarios × baseline/enabled-sync/enabled-off. Publish results.
 
 #### @GilboaAWS track
 
 - [ ] **S1.5 — Drift-retrain end-to-end**: `compression-dict-drift-ratio` trigger → new train run → promotion → old dict retirement. Integration test covers full lifecycle.
-- [ ] **S5.4 — Full §7.5 benchmark run**: all 6 scenarios × baseline/enabled-sync/enabled-off. Publish results.
 - [ ] **S3.5 — `MEMORY USAGE` + `maxmemory` accounting** for compressed robjs per R2.8.
-
-#### @ikolomi track (S6)
-
 - [ ] **S6.1 — COW invariant Tcl test** (`compression-cow-invariant.tcl`): runs every mutating command against a live compression job in parallel; asserts no corruption. **Merge blocker.** (§7.2)
 - [ ] **S6.2 — Replication integration tests**: full-sync with R2.6.8 uncompressed RDB, PSYNC correctness, mixed-version primary/replica.
 - [ ] **S6.3 — RDB round-trip stress**: save with many dicts, corrupt various fields, verify error detection (R2.6.5).
@@ -253,7 +250,7 @@ Total calendar: ~11 weeks assuming no significant delays. Series work was estima
 |---|---|---|---|
 | COW invariant violation discovered late in the audit | High | Phase 2 schedules audit before perf validation; if violation found, fall back to memcpy-at-enqueue per Appendix D for affected code paths. | @ikolomi |
 | ZSTD version pin causes build breakage on distros | Med | Vendor ZSTD in `deps/zstd/`, pin version; verify on CI matrix including musl. | @GilboaAWS (S7) |
-| §7.5 reveals unacceptable p99 regression | Med | Phase 2 gates on this; Appendix A rejected alternatives (LZ4) are a fallback. Worst case: narrow eligibility window via config defaults. | @GilboaAWS (S5) |
+| §7.5 reveals unacceptable p99 regression | Med | Phase 2 gates on this; Appendix A rejected alternatives (LZ4) are a fallback. Worst case: narrow eligibility window via config defaults. | @ikolomi (S5) |
 | Training on bio starves bio for other tasks | Low | Training is infrequent; enforce single-inflight train per §2.3. Perf test (S5) includes bio-load-during-train scenario. | @ikolomi (S1) |
 | Module authors not aware of DMA transparency requirements | Med | Explicit R2.9 DMA test in `tests/modules/compression.c` (S2.12 + S6.1). Docs call out in migration guide. | both |
 | Dict-cap exhaustion in pathological drift scenarios | Low | R2.3.11 enforces cap; `COMPRESSION DICT LIST` + `DICT DROP` give operator recovery. | @ikolomi (S1) |
