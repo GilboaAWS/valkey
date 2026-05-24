@@ -197,7 +197,7 @@ compressed_size + header_size >= uncompressed_size * (1 - compression-min-saving
 - **R2.11.1** Dedicated compression worker pool, sized by `compression-threads` (int, default `1`, range `0..16`, `MODIFIABLE_CONFIG`). `0` = disabled (feature becomes no-op). Separate from `io-threads`. (Q8)
 - **R2.11.2** Sweep pacing: `compression-sweep-max-cpu-pct` (int, default `25`, range `1..100`, `MODIFIABLE_CONFIG`). Applied only to background sweep batches; training and multi-key compression are naturally arrival-bounded. (Q8)
 - **R2.11.3** CPU pinning: `compression_cpulist` (string, default empty). Follows the existing `bio_cpulist` / `aof_rewrite_cpulist` precedent. (Q8)
-- **R2.11.4** Compression workers never touch `robj`. They consume and produce flat byte buffers. The main thread owns all `robj` mutation. (Q8)
+- **R2.11.4** Compression workers never touch `robj`, never mutate the dictionary registry, and never manage frame refcounts. They atomically load the active dict pointer, use the immutable `CDict*` for compression, produce a flat output buffer, and report a quiescent state. The main thread owns all `robj` mutation, registry mutation, and frame-ref accounting. Dictionary lifetime safety is guaranteed by the QSBR grace-period model (§4.4), not by per-job refcounting. (Q8)
 
 ### 2.12 Configuration summary
 
@@ -323,7 +323,7 @@ graph LR
 
 Separation invariants:
 - The worker pool is independent of `io-threads`. They are sized and scheduled separately.
-- Workers never touch `robj`. Main thread owns all `robj` mutation.
+- Workers never touch `robj` or mutate the registry — see §2.11 R2.11.4 for the full worker contract and §4.4 for the QSBR lifetime model.
 - `bio` is reused for training (one-at-a-time, long-running); not for per-value compression.
 - Synchronous decompression runs on the main thread directly; no offload.
 
@@ -403,22 +403,70 @@ typedef struct compressionDict {
     uint32_t        dictID;
     unsigned char  *bytes;          /* raw training output or imported bytes */
     size_t          bytes_len;
-    ZSTD_CDict     *cdict;          /* NULL for retiring dicts (decompress-only) */
+    ZSTD_CDict     *cdict;          /* immutable after publication; NULL only after free */
     ZSTD_DDict     *ddict;
-    size_t          refcount;       /* number of compressed frames referencing this dictID */
+    size_t          frame_refs;     /* number of installed compressed frames referencing
+                                       this dictID (main-thread only) */
     compressionDictState state;
     mstime_t        promoted_at_ms;
+    uint64_t        retire_worker_gen[COMPRESSION_WORKERS_MAX];
+                                    /* per-worker quiescent-gen snapshot taken at
+                                       retirement time (see QSBR model below) */
 } compressionDict;
 
 typedef struct compressionRegistry {
     compressionDict *dicts[COMPRESSION_DICT_MAX];  /* sized by compression-dict-max-versions */
     int              n_dicts;
-    compressionDict *active;        /* active pointer; atomic read/swap */
+    _Atomic(compressionDict *) active;  /* published via atomic store; workers load atomically */
+    compressionDict *retiring_list;     /* singly-linked list of dicts pending GC */
     /* counters, error totals, etc. */
 } compressionRegistry;
 ```
 
-The registry is **single-writer (main thread)**. Reads can happen from workers (for digested dicts) and the main thread (for decompression). Readers atomically load `active` or look up by dictID; they hold a pointer for the duration of a single compress/decompress call, then release it. Retirement waits until `refcount == 0`; this is guaranteed to happen eventually as old frames are rewritten/expired, or forced via `COMPRESSION SWEEP`.
+#### Dictionary lifetime model — QSBR (Quiescent-State-Based Reclamation)
+
+The registry uses a grace-period reclamation model inspired by the Linux kernel's RCU (Read-Copy-Update) pattern. The motivation is **decoupling**: the main thread owns the dictionary registry exclusively (writes, retirement, GC, frame-ref accounting), while compression workers operate against an immutable, self-managed view of the active dictionary. Workers never call into the registry on the per-job hot path. The main thread retires dicts safely without having to track in-flight jobs — it observes worker generation counters directly.
+
+**Ownership split:**
+
+| Owner | Responsibilities |
+|---|---|
+| Main thread | Dictionary creation, promotion (atomic publish), retirement, frame-ref accounting, GC, final free |
+| Workers | Load active pointer (atomic read), use immutable `CDict*` for compression, report quiescent state after each job |
+
+**How it works:**
+
+1. **Promotion:** Main thread creates a new `compressionDict`, atomically stores it as `registry->active`. The previous active dict moves to the retiring list via `compressionDictStartRetirement()`.
+
+2. **Worker usage:** A worker atomically loads `registry->active` to get the current dict pointer. The `compressionDict` and its `CDict*` are immutable after publication — safe to read without locks. The worker uses the `CDict*` for compression, then reports a quiescent state.
+
+3. **Quiescent reporting:** After finishing a job (including all `CDict` usage), the worker advances its per-worker `quiescent_gen` counter. This signals: "I no longer hold any dict pointer obtained before this point."
+
+4. **Retirement:** When the main thread retires a dict, it snapshots every worker's current `quiescent_gen` into `dict->retire_worker_gen[]`. The dict cannot be freed until every worker has advanced past its snapshotted value.
+
+5. **GC:** Periodically (from `compressionCron`, after result drain, etc.), the main thread calls `compressionDictTryGc()` which checks each retiring dict: if `frame_refs == 0` AND all workers have crossed the grace period, the dict is freed.
+
+6. **Grace barriers (wake-all via cond_broadcast):** If a worker is idle (blocked on the SPMC inbox cond var waiting for work), it may never advance its generation. The main thread forces progress by issuing a wake-all on the inbox (see §4.6 "wake-all primitive"). Every blocked consumer wakes simultaneously via `pthread_cond_broadcast`, advances its generation if a barrier signal is set, then either resumes consuming or re-blocks. Enqueueing barrier jobs into the SPMC inbox is *not* sufficient — under work-stealing semantics a single worker could drain all barriers while siblings stay asleep on the cond var.
+
+7. **Bounding the retiring list (cap interaction with R2.3.3):** The retiring list is a subset of `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, or run `COMPRESSION SWEEP` to force-rewrite frames referencing the oldest retiring dict so it can drain).
+
+**Why QSBR over per-job refcounting:**
+
+Two approaches were considered:
+
+| | Per-job refcount | QSBR grace-period |
+|---|---|---|
+| Worker contract | Receives `CDict*` in job struct; main thread manages inc/dec per job | Loads active pointer when ready; reports quiescent after use |
+| Pointer lifetime | Caller must decRef on every completion path (success, error, discard) | Structural guarantee — dict outlives all workers that observed it |
+| Encapsulation | Job carries a cross-thread pointer whose lifetime depends on external discipline | Worker self-serves; registry internally guarantees safety |
+| Failure mode of a bug | Memory leak (missed decRef) or use-after-free (early decRef) | Delayed reclamation (missed quiescent report) — safe direction |
+| API surface | incRef, decRef, pass pointer in job | loadActive, reportQuiescent, barrier |
+
+The QSBR approach was chosen because:
+- It avoids passing lifetime-managed pointers across thread boundaries: workers never call into the registry on the per-job hot path, and the registry retires dicts by observing worker generation counters directly rather than tracking in-flight jobs.
+- The worker contract is minimal and hard to misuse: load, use, report done. No refcount management on any control path.
+- Failure modes are safe-directional: a missed quiescent report delays reclamation but cannot cause use-after-free.
+- The complexity is concentrated in the registry (written once, tested thoroughly) rather than distributed across every job completion path.
 
 ### 4.5 `COMPRESSION` subcommand container
 
@@ -460,6 +508,13 @@ The outbox side has its own back-pressure: if a worker has a result to post but 
 
 Both back-pressure events are categorized separately from the normal operating signals (`compression_candidates_pending` gauge, `compression_sweep_pacing_sleeps_total`) so operators can identify the exact root cause without reading logs. See §2.10 R2.10.4 for the remediation table.
 
+**Wake-all primitive (used by QSBR grace barriers — §4.4 step 6).** The QSBR model needs a way to advance the generation counter of every worker, including idle workers blocked on the inbox cond var. The existing `mutexqueue.h` (which provides the pthread-cond-var-based blocking semantics underneath the SPMC inbox) is extended with **two new APIs** that broadcast to every blocked consumer rather than waking one at a time:
+
+- A wake-all primitive that calls `pthread_cond_broadcast` on the queue's cond var so every idle worker exits its `pthread_cond_wait` simultaneously. Each woken worker checks registry-side state for the wake reason (advance generation? shutdown?) and acts accordingly without consuming a real job.
+- A shutdown-signal primitive that combines the wake-all with a flag the workers read after waking, used during pool teardown.
+
+Enqueueing N "barrier jobs" into the SPMC inbox is **not** equivalent to a wake-all: under work-stealing semantics the dequeue is not round-robin, so a single fast worker can drain all barrier jobs while siblings stay asleep on the cond var. The cond_broadcast path is the only mechanism that guarantees every worker wakes up.
+
 Job structure:
 
 ```c
@@ -473,9 +528,10 @@ typedef struct compressionJob {
                                   because the immutable-snapshot invariant (R2.4.4)
                                   guarantees the sds metadata bytes are not mutated
                                   while the worker holds the reference. */
-    uint32_t      dict_id;     /* snapshot of active dict_id at enqueue (see rationale
-                                  below) */
     /* filled by worker: */
+    uint32_t      dict_id;     /* dict_id of the dict the worker used (loaded at
+                                  compress time from the active pointer); carried into
+                                  the compressed frame header for decompression. */
     void         *dst;         /* zmalloc'd buffer: compressedHeader + compressed frame.
                                   Ownership transfers to the main thread on outbox
                                   delivery; main thread hands it to
@@ -491,8 +547,10 @@ typedef struct compressionJob {
 - Enqueue holds `incrRefCount(val)` so the sds pointer stays valid for the worker **and** the object has `refcount >= 2`, which forces any subsequent mutating command to COW instead of mutating in place (Valkey's `dbUnshareStringValue` discipline — see R2.4.4 and R2.4.5 for the invariant and its enforcement).
 - On the outbox side, the main thread re-fetches the current `robj` for the key; if it has changed (version counter moved), the compressed result is discarded.
 - `decrRefCount(val)` is called after the outbox handler finishes. This drops the refcount back to 1 and restores in-place-mutate eligibility for future commands.
+- The worker loads the active dict pointer atomically at compress time (not at enqueue time). The dict pointer is guaranteed valid by the QSBR grace-period model (§4.4) — the dict cannot be freed until all workers have reported a quiescent state after retirement.
+- After compression (regardless of success or error), the worker calls `compressionWorkerReportQuiescent()` to advance its generation counter. This is the single synchronization obligation of the worker.
 
-**Why the main thread snapshots `dict_id` at enqueue** (rather than letting the worker read `registry->active`): the registry is documented in §4.4 as single-writer with no worker readers. If the worker read `active` at compress time, it would become a reader, and refcount management would have to be thread-safe from workers too — incref-on-load with retry against retirement, decref-on-done on every path. Snapshotting `dict_id` at enqueue on the main thread, paired with the existing refcount bump, keeps the registry's concurrency surface at "main-thread writes, no reads from workers." Staleness is bounded and harmless: if retraining promotes a new dict between enqueue and worker pickup, the in-flight job compresses with the older (still valid) dict, the frame carries its `dict_id` so decompression continues to work, and the next enqueue picks up the new dict.
+**Why the worker loads the active dict itself** (rather than receiving it in the job): the QSBR model (§4.4) structurally guarantees that any dict pointer loaded by a worker remains valid until the worker reports quiescent. This decouples worker code from registry lifetime concerns — the worker contract is minimal: load the active dict when ready, use it, report done. No registry mutation, no per-job refcount management, no pointer-in-queue lifetime concerns. The main thread, which owns the registry, observes worker generation counters to determine when retired dicts are safe to free; it does not have to track in-flight jobs.
 
 **Why the worker produces a flat `dst` buffer and not an `robj`**: this is the §2.11 R2.11.4 invariant — compression workers never touch `robj`. Three reasons it stays this way: (1) `robj` manipulation in Valkey assumes single-threaded access (no atomics on refcount, shared-object singletons, LRU/LFU bit updates, encoding-tag swaps); moving `robj` work to workers would silently break those assumptions. (2) Failed compressions (net-savings guard in R2.4.3) are cheap to discard — `zfree(dst)` — rather than allocate-and-free an entire `robj` container. (3) The `robj` container still has to be allocated and installed on the main thread anyway, because it carries LRU/LFU bits inherited from the old object and has to be swapped into the kvstore. Worker-side flat buffer + main-thread `createCompressedObject(buffer, len)` splits the work along the invariant without a memcpy — the zero-copy ownership contract in `compression_header.h` makes this explicit.
 
