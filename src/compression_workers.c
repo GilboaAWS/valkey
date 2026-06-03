@@ -35,8 +35,13 @@
 
 #include "server.h"
 #include "compression_workers.h"
+#include "compression_header.h"
 #include "compression_registry.h"
 #include "mutexqueue.h"
+
+#ifdef USE_ZSTD
+#include <zstd.h>
+#endif
 #include "queues.h"
 
 #include <pthread.h>
@@ -136,6 +141,28 @@ static void *workerThreadMain(void *arg) {
     valkey_set_thread_title(thd_name);
     serverSetCpuAffinity(server.compression_cpulist);
 
+    /* Per-worker ZSTD compression context. Not thread-safe, so each
+     * worker owns its own. Allocated once, reused for every job —
+     * keeps allocator pressure off the per-job hot path. Freed at
+     * thread exit (along the same exit_thread label as the rest of
+     * the worker's owned state).
+     *
+     * Only present when USE_ZSTD is compiled in. Without it, the
+     * encoder body below short-circuits to the "not compressed"
+     * branch identically to the no-active-dict case, and no CCtx is
+     * needed. */
+#ifdef USE_ZSTD
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    if (cctx == NULL) {
+        serverLog(LL_WARNING,
+                  "Compression worker %d: ZSTD_createCCtx() failed; "
+                  "worker exiting. Compression effectively disabled "
+                  "until the pool is restarted.",
+                  worker_id);
+        return NULL;
+    }
+#endif
+
     while (!atomic_load(&pool.shutdown_requested)) {
         /* Block until a job arrives or someone calls
          * compressionWorkersWakeAll() (which broadcasts on the inbox
@@ -171,19 +198,94 @@ static void *workerThreadMain(void *arg) {
 
         compressionJob *job = (compressionJob *)item;
 
-        /* Phase 1 placeholder: pass-through. S2.5 replaces the body
-         * with `ZSTD_compress_usingCDict(...)` against the dict
-         * loaded from `job->dict_id` (or the active dict if 0).
-         *
-         * The placeholder semantics — `dst = NULL`, `dst_len = 0`,
-         * `err = 0` — tell the outbox drain "nothing to install,
-         * just clean up the job and release the caller's refcount."
-         * This lets the rest of the plumbing (write-path enqueue,
-         * outbox drain, refcount lifecycle) be exercised end-to-end
-         * before the encoder lands. */
-        job->dst = NULL;
-        job->dst_len = 0;
-        job->err = 0;
+        /* Load the active dict atomically. The QSBR contract (§4.4)
+         * guarantees the pointer is valid until we report quiescent
+         * at end-of-iteration. The pointer is stable for our use here
+         * because retirement is always preceded by an atomic publish
+         * of a new active dict, and the registry never frees a dict
+         * while any worker may still be holding it. */
+        compressionDictPair *active = compressionRegistryActive();
+
+        if (active == NULL) {
+            /* "compression-enabled yes but no active dict yet" state
+             * documented in R2.1.5. Mark the job as not-compressed so
+             * the drain handler can dispose without touching dst.
+             * err=1 is the not-an-actual-ZSTD-error sentinel meaning
+             * "worker chose not to compress"; ZSTD error codes are
+             * always negative when wrapped in size_t (they fit in the
+             * sign bit), so positive `err` values are reserved for
+             * worker-policy decisions like this.
+             *
+             * Same branch is taken when USE_ZSTD is not compiled in
+             * (the BUILD_ZSTD=no build mode): the registry is empty
+             * and the worker simply marks every job not-compressed. */
+            job->dict_id = 0;
+            job->dst = NULL;
+            job->dst_len = 0;
+            job->err = 1;
+        }
+#ifdef USE_ZSTD
+        else {
+            size_t src_len = sdslen(job->src);
+            size_t bound = ZSTD_compressBound(src_len);
+            size_t alloc = COMPRESSION_HEADER_SIZE + bound;
+            void *buf = zmalloc(alloc);
+
+            /* Compress directly into buf at offset HEADER_SIZE. The
+             * header is written in-place after we know the actual
+             * compressed size. */
+            size_t got = ZSTD_compress_usingCDict(
+                cctx,
+                (char *)buf + COMPRESSION_HEADER_SIZE, /* dst */
+                bound,                                 /* dst capacity */
+                job->src, src_len,                     /* src + len */
+                active->cdict);                        /* dict */
+
+            if (ZSTD_isError(got)) {
+                zfree(buf);
+                job->dict_id = 0;
+                job->dst = NULL;
+                job->dst_len = 0;
+                /* Preserve the error code. ZSTD error codes are
+                 * negative-when-cast-to-int, so a downcast keeps
+                 * sign. */
+                job->err = (int)(ssize_t)got;
+            } else {
+                /* Shrink to actual size to avoid leaking
+                 * ZSTD_compressBound slack into used_memory. May copy
+                 * if the shrink crosses a jemalloc size class —
+                 * acceptable per design §5.2 (paid on worker thread,
+                 * bytes are small). zrealloc preserves the existing
+                 * contents up to min(old, new) size. */
+                size_t total = COMPRESSION_HEADER_SIZE + got;
+                void *shrunk = zrealloc(buf, total);
+                if (shrunk == NULL) {
+                    /* zrealloc shrink failure is allocator-specific.
+                     * Defensive: keep the original buffer (which is
+                     * still valid; zrealloc on shrink only releases
+                     * the old block when it returns a different
+                     * pointer or NULL on success). On NULL we leave
+                     * `buf` allocated and use it, paying the slack
+                     * cost rather than failing the job. */
+                    shrunk = buf;
+                }
+
+                /* Encode the header into the first 16 bytes of the
+                 * (now-shrunk) buffer. dict_id from the active dict
+                 * goes into alg_meta. */
+                compressionHeaderEncode((unsigned char *)shrunk,
+                                        COMPRESSION_ALG_ZSTD_MAGIC,
+                                        active->dict_id,
+                                        (uint32_t)src_len,
+                                        (uint32_t)got);
+
+                job->dict_id = active->dict_id;
+                job->dst = shrunk;
+                job->dst_len = total;
+                job->err = 0;
+            }
+        }
+#endif /* USE_ZSTD */
 
         /* Post the result. Outbox is bounded; on full, retry until it
          * drains (the main thread's compressionAfterSleep is
@@ -215,6 +317,16 @@ static void *workerThreadMain(void *arg) {
     }
 
 exit_thread:
+    /* Free the per-worker CCtx allocated at thread start. ZSTD_freeCCtx
+     * is documented as accepting NULL safely, but the cctx allocation
+     * above bails out before reaching this label if it returned NULL,
+     * so the pointer is non-NULL whenever we get here.
+     *
+     * Only present when USE_ZSTD is compiled in (matches the gating
+     * on the allocation site above). */
+#ifdef USE_ZSTD
+    ZSTD_freeCCtx(cctx);
+#endif
     return NULL;
 }
 
@@ -392,23 +504,161 @@ int compressionWorkersDrainOutbox(int budget) {
         for (size_t i = 0; i < got; i++) {
             compressionJob *job = jobs_out[i];
 
-            /* Phase 1 placeholder: nothing to install. S2.5 replaces
-             * this with the real net-savings guard + robj install
-             * via createCompressedObject(job->dst, job->dst_len),
-             * plus compressionRegistryIncRef(job->dict_id) and the
-             * decrRefCount that releases the caller's pin from
-             * compressionWorkersEnqueue.
-             *
-             * For S2.4 the placeholder worker leaves dst=NULL/dst_len=0,
-             * so there's nothing to install and nothing to free in
-             * dst. We still free the job struct itself. */
-            if (job->dst != NULL) zfree(job->dst);
+            /* S2.5 drain handler: post-compression net-savings guard,
+             * then dispose. Real install (createCompressedObject +
+             * dbOverwrite + compressionRegistryIncRef + decrRefCount on
+             * the caller's value pin) lands with the write-path hook
+             * in S2.7; that PR will introduce a real production caller
+             * (dbAdd / dbOverwrite). For now the worker-pool plumbing
+             * runs end-to-end against test fixtures only, so we
+             * exercise the encoder + guard but not the install. The
+             * S2.5 round-trip tests use a peeking variant of drain
+             * (testOnlyCompressionWorkersDrainOutbox) that does NOT
+             * free the buffer, letting the test verify decompression. */
+            if (job->err != 0 || job->dst == NULL) {
+                /* Worker chose not to compress (no active dict yet) or
+                 * ZSTD reported an error.
+                 *
+                 * TODO(S4.1): two distinct counter contributions feed
+                 * here in S4.1:
+                 *   - job->err > 0 (worker policy, e.g. no-dict): no
+                 *     INFO counter — this is a benign expected state
+                 *     (R2.1.5), tracked indirectly via
+                 *     compression_state == "active" || "idle".
+                 *   - job->err < 0 (real ZSTD error): increment
+                 *     compression_errors_total per R2.10.1 and emit a
+                 *     rate-limited LL_WARNING per R6.1.
+                 * No live_ratio contribution — no compression actually
+                 * ran, so there's no measured ratio to fold in. */
+                if (job->dst != NULL) zfree(job->dst);
+            } else {
+                /* Net-savings guard (R2.4.3 / R2.2 second block):
+                 *
+                 *   compressed_size + header_size >=
+                 *       uncompressed_size * (1 - savings_ratio_pct/100)
+                 *
+                 * Equivalent integer form below avoids floating point.
+                 * Note that `job->dst_len` already includes the
+                 * header (HEADER_SIZE + frame_len), so it IS the
+                 * full on-heap footprint we want to compare against. */
+                size_t uncompressed_len = sdslen(job->src);
+                int pct = server.compression_min_savings_ratio;
+                size_t threshold =
+                    uncompressed_len - (uncompressed_len * (size_t)pct / 100u);
+
+                if (job->dst_len >= threshold) {
+                    /* No useful saving — discard the compressed form,
+                     * leave the value uncompressed.
+                     *
+                     * TODO(S4.1): two contributions here in S4.1:
+                     *   - compression_skipped_incompressible++ per
+                     *     R2.10.1.
+                     *   - Fold the actual measured ratio
+                     *     (job->dst_len / uncompressed_len) into the
+                     *     EMA compression_live_ratio_10m per R2.3.5
+                     *     ("rejections contribute their actual
+                     *     measured ratio, typically in [0.9, 1.05]").
+                     *     Sustained high rejection rate inflates the
+                     *     metric and naturally trips the drift
+                     *     threshold → drives retraining. */
+                    zfree(job->dst);
+                }
+                /* TODO(S2.7): install path — re-resolve robj by
+                 * (dbid, key, version), call
+                 * createCompressedObject(OBJ_STRING, job->dst,
+                 * job->dst_len), dbOverwrite, then
+                 * compressionRegistryIncRef(job->dict_id) and
+                 * decrRefCount on the caller's pin from
+                 * compressionWorkersEnqueue.
+                 *
+                 * TODO(S4.1): on successful install:
+                 *   - compression_compressions_per_sec rate update.
+                 *   - Fold the success ratio
+                 *     (job->dst_len / uncompressed_len) into the EMA
+                 *     compression_live_ratio_10m per R2.3.5.
+                 *
+                 * Until S2.7 lands the buffer leaks here in the
+                 * unit-test environment (no production caller yet).
+                 * Tests that need to inspect the compressed buffer
+                 * use testOnlyCompressionWorkersDrainOutbox which
+                 * extracts jobs before this handler runs. */
+                else {
+                    zfree(job->dst); /* placeholder until S2.7 */
+                }
+            }
             zfree(job);
 
             total++;
         }
     }
     return total;
+}
+
+/* ============================================================
+ * Test-only entry points (gtest)
+ * ============================================================
+ *
+ * Convention follows quicklist.c / intset.c: define here, do NOT
+ * declare in compression_workers.h. The gtest unit test declares
+ * what it needs locally in its own extern "C" block. This keeps
+ * the production-callable surface (the public header) free of
+ * test-only symbols.
+ *
+ * The S2.5 encoder-path tests need to inspect the worker's
+ * compressed output before the production drain handler frees it.
+ * The peek-and-extract entry point below pulls completed jobs off
+ * the outbox without freeing; the read entry point projects the
+ * file-private compressionJob shape into a flat result struct
+ * (defined alongside the gtest test code that uses it) so the
+ * production code carries no record of the private job shape;
+ * the free entry point frees a job + its dst buffer.
+ */
+
+/* Pop up to `budget` completed jobs into `jobs_out` without freeing
+ * them. Caller takes ownership and MUST free each job via
+ * testOnlyCompressionWorkersFreeJob. */
+int testOnlyCompressionWorkersDrainOutbox(void **jobs_out, int budget) {
+    if (!pool.initialized || jobs_out == NULL || budget <= 0) return 0;
+
+    int total = 0;
+    while (total < budget) {
+        size_t batch = (size_t)(budget - total);
+        if (batch > 64) batch = 64;
+        size_t got = mpscDequeueBatch(&pool.outbox,
+                                      jobs_out + total,
+                                      batch);
+        if (got == 0) break;
+        total += (int)got;
+    }
+    return total;
+}
+
+/* Free a job + its dst buffer, mirroring what the production drain
+ * handler does after install. */
+void testOnlyCompressionWorkersFreeJob(void *job_ptr) {
+    if (job_ptr == NULL) return;
+    compressionJob *job = (compressionJob *)job_ptr;
+    if (job->dst != NULL) zfree(job->dst);
+    zfree(job);
+}
+
+/* Project the file-private compressionJob into the caller-provided
+ * fields. The caller's struct shape is defined in the gtest test code;
+ * we pass field pointers individually here so this function does not
+ * have to know about that struct's layout. NULL-tolerant: any
+ * out-pointer may be NULL to skip projecting that field. */
+void testOnlyCompressionWorkersJobRead(void *job_ptr,
+                                       const char **out_src,
+                                       void **out_dst,
+                                       size_t *out_dst_len,
+                                       uint32_t *out_dict_id,
+                                       int *out_err) {
+    compressionJob *job = (compressionJob *)job_ptr;
+    if (out_src) *out_src = job->src;
+    if (out_dst) *out_dst = job->dst;
+    if (out_dst_len) *out_dst_len = job->dst_len;
+    if (out_dict_id) *out_dict_id = job->dict_id;
+    if (out_err) *out_err = job->err;
 }
 
 void compressionWorkersWakeAll(void) {
