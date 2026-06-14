@@ -41,7 +41,7 @@ Note: the **on-disk RDB file may contain compressed values** (to preserve the me
 
 - **Reduce memory** by ≥30% on target workloads (POC baseline) at production-safe CPU cost (<20% TPS degradation).
 - **Transparent** to clients, scripts, transactions, replication, AOF, and modules — no wire or semantic changes.
-- **Opt-in**, with a single master switch (`compression-enabled`) and zero fixed cost when disabled.
+- **Opt-in**, with a single master switch (`compression-master-switch`) and zero fixed cost when set to `off`.
 - **Observable** — memory saved, compression ratio, training events, dict lifecycle, and errors exposed via `INFO`, logs, and latency monitor.
 - **Bounded blast radius** — the feature is encapsulated in a small number of files; existing code paths are touched only through well-defined helpers.
 - **Extensible** — the encoding-tag design structurally supports future value types and async decompression without breaking changes.
@@ -58,11 +58,51 @@ Requirements are consolidated from `idea-honing.md`. Each bullet is traceable to
 
 ### 2.1 Master switch and operator surface
 
-- **R2.1.1** The feature is gated by a master switch `compression-enabled` (bool, default `no`, `MODIFIABLE_CONFIG`). When `no`, no compression CPU is spent and no worker threads run. (Q5)
-- **R2.1.2** Two surfaces toggle the switch: `CONFIG SET compression-enabled yes|no` (primary) and `COMPRESSION ENABLE`/`COMPRESSION DISABLE` (convenience alias, writes a `LL_NOTICE` log entry for audit trails). (Q5)
-- **R2.1.3** `no → yes` transition: background sweeper starts on the next cron tick; values are compressed opportunistically by new writes and by the sweeper. `COMPRESSION SWEEP` triggers immediate sweep. **Operators who want to enable without auto-sweeping existing data** can achieve this without any new config: set `compression-threads 0` before the toggle (worker pool disabled, candidates queue but no work happens), flip the master switch, then raise `compression-threads` to 1+ when ready to drain the queue. This is the symmetric counterpart to the `yes → no` default in R2.1.4. (Q5)
-- **R2.1.4** `yes → no` transition: new writes stop being compressed; existing compressed values continue to be decompressed **on read only** (cold/untouched keys remain compressed indefinitely); the dictionary registry stays alive. No automatic full-keyspace decompress. Operator explicitly runs `COMPRESSION SWEEP direction=decompress` to decompress all keys in the background — this **guarantees eventual full coverage** regardless of read activity, and eventually drains the compressed-frame population so the dictionary registry can retire. Peak memory during an explicit sweep grows proportionally to the uncompressed dataset size (factor `1/compression_ratio` vs. the compressed baseline — e.g. ~2–3× for typical ratios of 0.3–0.5), but growth is bounded by `compression-sweep-max-cpu-pct` pacing — never a synchronous spike. (Q5)
-- **R2.1.5** A third state — "`compression-enabled yes` but no active dictionary for new writes" — behaves identically to disabled for writes. Decompression of any existing compressed frames continues to work: **refcount-based dictionary retirement (R2.3.4) and the safety check in `COMPRESSION DICT DROP` (§4.5) together guarantee that a dict cannot be freed while any frame references it.** A "retiring" dict stays in the registry and services decompressions until its last referencing frame is rewritten, overwritten, expired, or explicitly decompressed. The state *"no dicts in registry AND compressed frames exist"* is by-construction unreachable. Documented as expected behavior. (Q5)
+The feature is governed by **three orthogonal mechanics**:
+
+1. **Master switch** (`compression-master-switch`) — operator declares the desired DB compression state.
+2. **Sweeper** (`compression-active-sweeper`) — drives the keyspace toward the master-switch-declared state when enabled.
+3. **Read-path transient view** (R2.5.7) — read optimization whose drain mode (restore vs. permanent-decompress) is gated on the master-switch state.
+
+Mechanics 1 and 2 are configured independently. Mechanic 3 follows from mechanic 1 automatically (no separate operator control). See §3 for the architecture-level treatment.
+
+- **R2.1.1** `compression-master-switch` (enum, default `off`, `MODIFIABLE_CONFIG`). Operator declares the desired DB state. Three values:
+  - `off` — feature is paused. New writes do not compress. Reads decompress-then-restore via the transient view (R2.5.7); the DB compression state is frozen across an arbitrary period. No background work. Existing compressed frames are preserved across reads (the transient view restores them at every event-loop boundary). (Q5)
+  - `compression` — new writes are compressed when eligible (R2.2). Reads decompress-then-restore via the transient view (R2.5.7). Productive state for compressed workloads. (Q5)
+  - `decompression` — new writes do not compress. Reads decompress permanently (transient view permanent-decompress mode, R2.5.7). The active dict is auto-retired on transition (R2.1.5) so it can drain. Operator-driven drain mode. (Q5)
+
+- **R2.1.2** `compression-active-sweeper` (enum, default `disabled`, `MODIFIABLE_CONFIG`). Controls automatic background work that drives the keyspace toward the master-switch-declared state. Two values:
+  - `disabled` — no automatic work. Operator can still trigger one-shot passes via `COMPRESSION SWEEP FORCE` (R2.1.4). (Q5)
+  - `enabled` — sweeper runs cron-driven passes that converge the keyspace toward the master-switch-declared state. With `master=compression`, the sweep enqueues qualifying RAW values to the worker pool. With `master=decompression`, the sweep calls `compressionPermanentlyDecompress` directly per key on the main thread (worker pool is bypassed). With `master=off`, the sweeper has no direction and idles. The sweep itself is paced by `compression-sweep-max-cpu-pct` (R2.11.2). (Q5)
+
+- **R2.1.3** `compression-active-sweeper-interval` (time, default `0`, `MODIFIABLE_CONFIG`). Controls re-runs of the sweeper after a pass completes. Default `0` is "no periodic re-runs" — the sweeper does ONE pass on master-switch direction change and then idles. The first pass on direction change runs immediately regardless of this setting; the interval governs subsequent re-runs. (Q5)
+  - `0` — sweeper does one pass and stops. Catch-up requires `COMPRESSION SWEEP FORCE` or a master-switch direction change. Recommended default — minimizes idle-keyspace iteration cost. The sweeper still runs the initial pass after a direction change so the operator's declared state is achieved at least once.
+  - Positive N — sleep N seconds between passes. Useful for workloads where missed items accumulate (sustained worker-pool back-pressure drops, eligibility-predicate config changes that newly qualify values). For very large keyspaces a single pass at default `compression-sweep-max-cpu-pct=25` may take longer than the configured interval, in which case the sweeper effectively runs continuously — that's natural scaling, not an error.
+
+- **R2.1.4** `COMPRESSION SWEEP FORCE` (operator command — see §4.5). Triggers an immediate one-shot pass regardless of the `compression-active-sweeper` setting and regardless of the periodic timer. Uses the master-switch's current direction. Behavior:
+  - `master=off` → reject with `-ERR compression is off`. There is no direction to sweep in.
+  - sweeper currently scanning (`enabled` + mid-pass): no-op (already running).
+  - sweeper sleeping (`enabled` + mid-interval): wake immediately, restart pass.
+  - sweeper disabled: run one pass; the `compression-active-sweeper` config is **not changed**.
+
+  This is the operator's catch-up affordance — they can leave `compression-active-sweeper=disabled` (no idle-keyspace iteration) and run `SWEEP FORCE` from a runbook, cron job, or after observing `compression_candidates_dropped_total` climb. (Q5)
+
+- **R2.1.5** Master-switch transitions:
+  - **Any direction change with `compression-active-sweeper=enabled`** → wake the sweeper from sleeping/idle, reset cursor, restart pass with the new direction. The sweeper takes its direction from the current master-switch state on every iteration; mid-pass switches resolve at the next cron tick.
+  - **Any transition INTO `decompression`** (from `compression` or from `off`) → the active dict is auto-retired (`compressionRegistryRetire(active)`) if there is one. The drain mode requires the dict to be in `RETIRING` state so `canFree()` can succeed once `frame_refs == 0` and workers have quiesced past the snapshot (§4.4 QSBR); without the retire, the dict would stay ACTIVE and never be reclaimed even after drain completes. New compression eligibility is gated by `master == compression`, so the dict cannot accept new frame references in the new state — retirement is safe. Workers are protected by QSBR; existing compressed frames keep their refs and the dict stays in `RETIRING` state until they all drain.
+  - **`compression → off`** → no auto-retirement. The `off` state freezes the DB compression state — existing compressed frames stay compressed, the active dict stays in the registry as ACTIVE, no background work runs. If the operator later flips back to `compression`, productive operation resumes with the same active dict (no retraining required). If the operator instead flips to `decompression`, the retire-on-transition-into-decompression rule (above) handles it then. Operator can manually reclaim the dict via `COMPRESSION DICT DROP <id>` if memory reclamation is desired during a `compression → off` pause.
+  - **`decompression → off`** → no additional action. The active dict was already retired on the prior transition into `decompression`; it continues draining if frames remain. Once `frame_refs == 0` and workers have quiesced, the dict is freed automatically regardless of the master-switch state at that moment.
+  - **`off → compression` or `decompression → compression`** → no auto-retirement. From `off`: the previously-active dict (if any) remains ACTIVE and is reused for new compressions — no retraining. From `decompression`: there is no active dict (was retired on the earlier transition); the system enters R2.1.7's "no active dict" sub-state until training fires (R2.3.5) and a new dict is promoted.
+
+  Effect: with `master=decompression + compression-active-sweeper=enabled` running to completion, the active dict's memory is auto-reclaimed once drain completes, without operator intervention. With `master=off`, the registry state is frozen — operator must explicitly drop dicts to reclaim. (Q5)
+
+- **R2.1.6** Configuration validation rules. All combinations of `(master, sweeper, threads)` are allowed; the operator owns the controls and Valkey reports the consequences. Two combinations are non-functional but allowed (warned, not rejected):
+  - **`master=off + sweeper=enabled`** — sweeper has no direction; idles. Documented as a no-op state. No warning logged on its own; the situation is implied by the master-switch state.
+  - **`master=compression + compression-threads=0`** — write-path enqueues drop (worker pool refuses), and a sweep pass would also drop every candidate. Logged at `LL_WARNING` once on transition into this state (boot config, the `compression-master-switch` apply hook, or the `compression-threads` apply hook). When the sweeper is scheduled in this state, it skips the pass with a rate-limited warning rather than iterating the keyspace pointlessly.
+
+  `master=decompression` and `master=off` are agnostic to `compression-threads` count — the worker pool is exclusively used for forward-direction (compress) work. Decompression sweeps and transient-view permanent-decompress run on the main thread. (Q5)
+
+- **R2.1.7** Third state — "`master=compression` but no active dictionary for new writes" — behaves identically to `off` for writes. Decompression of any existing compressed frames continues to work: refcount-based dictionary retirement (R2.3.4) and the safety check in `COMPRESSION DICT DROP` (§4.5) together guarantee that a dict cannot be freed while any frame references it. A "retiring" dict stays in the registry and services decompressions until its last referencing frame is rewritten, overwritten, expired, or explicitly decompressed. The state *"no dicts in registry AND compressed frames exist"* is by-construction unreachable. Documented as expected behavior. (Q5)
 
 ### 2.2 Value eligibility
 
@@ -111,7 +151,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
 - **R2.3.1** The server maintains a **dictionary registry**: a small set of `{dictID, raw_bytes, ZSTD_CDict*, ZSTD_DDict*, refcount, state}` entries. State ∈ `{active, retiring, retired}`. (Q1)
 - **R2.3.2** At most **one** dictionary is `active` at any time (the one used to compress new values). Zero-or-more are `retiring` (decompress-only for older frames). (Q1)
-- **R2.3.3** The registry is capped at `compression-dict-max-versions` entries (int, default `4`, min `2`, `MODIFIABLE_CONFIG`). When full, retraining/promotion is blocked, a `LL_WARNING` log entry is emitted, and `compression_dict_cap_reached` is set to `1` in `INFO`. Operator unblocks by running `COMPRESSION SWEEP` to retire the oldest dict, or by raising the cap. (Q1)
+- **R2.3.3** The registry is capped at `compression-dict-max-versions` entries (int, default `4`, min `2`, `MODIFIABLE_CONFIG`). When full, retraining/promotion is blocked, a `LL_WARNING` log entry is emitted, and `compression_dict_cap_reached` is set to `1` in `INFO`. Operator unblocks by setting `compression-master-switch decompression` + `compression-active-sweeper enabled` (drains compressed frames so retiring dicts can release), by `COMPRESSION DICT DROP <dictID>` (force-retire a specific dict), or by raising the cap. (Q1)
 - **R2.3.4** A dict's refcount tracks the number of compressed frames that reference its dictID. When refcount hits zero, the dict transitions to `retired` and its CDict/DDict/raw_bytes are freed. (Q1)
 - **R2.3.5** **Training triggers** (Q9):
   - **First training**: fires when the total key count in the database reaches `compression-dict-min-training-keys` (default `1000`). This is a cheap O(1) check via `kvstoreSize`. The scan then collects eligible values (raw strings within size bounds). If the scan completes without collecting at least `compression-dict-min-training-keys` eligible samples, training aborts and enters a 30-second hardcoded cooldown before retrying.
@@ -177,7 +217,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 
     Natural pressure-relief exists for keys that get **written** after compression: `dbOverwrite` installs a fresh uncompressed robj, and partial-write commands (`APPEND`, `SETRANGE`, bit operations, module DMA-write per R2.7.6) decompress in place before mutating (the COW-invariant audit list in R2.4.5 enumerates the call sites). Read-only-hot keys have no equivalent demotion trigger.
 
-    Worst-case per-iteration decompression cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can run `COMPRESSION SWEEP direction=decompress` to drop all compressed frames and restart eligibility evaluation.
+    Worst-case per-iteration decompression cost is bounded by `compression-max-value-size` (R2.5.4: 128 KiB → ~128 µs at ~1 µs/KB). Cumulative cost is observable via `LATENCY HISTORY decompress-sync` (R2.10.2). Operators detecting the regression in `INFO compression` / latency monitor can drain the keyspace by setting `compression-master-switch decompression` (which auto-retires the active dict per R2.1.5 and switches the transient view to permanent-decompress mode per R2.5.7) and `compression-active-sweeper enabled` (R2.1.2) to converge the keyspace to fully RAW.
 
     Auto-demotion of read-hot compressed values is explicit v2 scope (Appendix D — "Read-hot compressed value auto-demotion"). The v1 ship gate is that the cost is **bounded** (R2.5.4) and **observable** (R2.10.2); operator action remains the only demotion path.
 
@@ -189,11 +229,27 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
     4. Replaces `o->val_ptr` with the temp sds and flips `o->encoding` from `OBJ_ENCODING_COMPRESSED` to `OBJ_ENCODING_RAW`.
     5. Returns `o` — every caller downstream sees a normal RAW string robj, with no awareness of compression.
 
-    The compressed form is restored at the next event-loop boundary. The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
+    **Drain mode at the next event-loop boundary** is gated on `compression-master-switch` state (R2.1.1). The `beforeSleep` hook reads the master switch once per invocation and dispatches:
+
+    | Master switch | Drain mode | Per-entry behavior |
+    |---|---|---|
+    | `compression` or `off` | **restore** | Pointer-swap each side-map entry back to compressed (the default behavior described below). The compressed form is preserved across the iteration boundary. |
+    | `decompression` | **permanent-decompress** | Each side-map entry is finalized as RAW: the compressed buffer is released via `releaseCompressedBuffer` (decRef dict frame-ref + reverse install accounting + free buffer); the temp sds stays installed as the value's `val_ptr`; encoding stays `OBJ_ENCODING_RAW`. The value is now permanently decompressed. |
+
+    This is the only cross-mechanism dependency in the design (Master switch ↔ Transient view per R2.1's three-orthogonal-mechanics framing). It exists because in `decompression` mode the operator's intent is "drain the DB", and a transient view that restores the compressed form would defeat that intent: every read-touched key would oscillate between compressed and uncompressed each iteration. Permanent-decompress mode honors the operator's declared state.
+
+    **Restore mode (default, `master ∈ {compression, off}`).** The `beforeSleep` hook calls `compressionRestoreTouchedKeys()` which iterates the side-map:
 
     - For each entry, re-fetch the kvstore slot for the key.
     - If `slot->value == o` (the pinned robj is still in the slot, unchanged), restore via pointer swap: free temp sds, restore compressed buffer to `val_ptr`, flip encoding back to `OBJ_ENCODING_COMPRESSED`. **This is O(1) per entry with no decompression or compression cost** — the compressed bytes never went away, we just had val_ptr point at the temp sds during the iteration.
-    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, free the saved compressed buffer, decrement the pin (which may free the orphaned robj).
+    - If `slot->value != o` (the value was overwritten, expired, or COW'd by a mutating command), discard the entry: free the temp sds, release the saved compressed buffer (via `releaseCompressedBuffer` — decRef dict + reverse accounting), decrement the pin (which may free the orphaned robj).
+
+    **Permanent-decompress mode (`master == decompression`).** Same iteration; for each entry, regardless of slot occupancy:
+    - Release the saved compressed buffer (decRef dict frame-ref + reverse install accounting + zfree via `releaseCompressedBuffer`).
+    - Leave the temp sds installed as `val_ptr`; encoding already RAW from materialize.
+    - Decrement the pin.
+
+    The two modes share `discardTransientEntry`'s release-and-decRef cleanup logic; only the restore vs leave-as-RAW step differs.
 
     **Mutation-detection invariant.** The pin (`refcount = 2`) forces any subsequent mutating command to honor the `dbUnshareStringValue` discipline (R2.4.4), creating a fresh robj that replaces the kvstore slot. The original (transient) robj is left intact for restoration; the slot now points elsewhere — detected at restoration time via pointer comparison. **No mutation-time hook is needed in any byte-mutating site.** This is the same staleness mechanism used by the write-path drain handler (R2.4.3 / §4.6).
 
@@ -223,13 +279,13 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
   - Layout per compressed value: `[RDB_ENCVAL | alg_magic (len-encoded) | alg_meta (len-encoded) | uncompressed_len (len-encoded) | compressed_len (len-encoded) | compressed frame bytes]`. `alg_magic` is the four-byte algorithm tag (ASCII `ZSTD`, reserved `LZ4 ` etc.); `alg_meta` is interpreted per algorithm — for ZSTD it is the `dict_id` of the referenced dictionary, for a hypothetical LZ4 backend it would be `0` or mode bits. Unknown `alg_magic` → reject as corrupt.
   - Dictionary bytes (ZSTD-specific) are written as `RDB_OPCODE_AUX` entries (key `"compression-dict-<dict_id>"`, value = raw bytes) **before** any compressed value that references them. Non-dict-based algorithms may omit AUX.
   - `RDB_VERSION` is bumped (`80 → 81`). Pre-feature loaders will refuse the file cleanly.
-- **R2.6.2** **RDB load when `compression-enabled yes`**: loader reads the dictionary bytes from AUX entries and uses them to construct `ZSTD_CDict`/`ZSTD_DDict` handles (via `ZSTD_createCDict`/`ZSTD_createDDict`; no retraining), inserts them into the registry, decompresses values on the fly only if needed (frames reference their dictID so they stay compressed in memory). (Q3, Q12)
-- **R2.6.3** **RDB load when `compression-enabled no`**: loader reads the dictionary bytes from AUX entries and constructs only the `ZSTD_DDict` handles needed (no retraining), decompresses every `RDB_ENC_COMPRESSED`-marked value inline, stores uncompressed, discards DDicts after load. (Q3)
-- **R2.6.4** **Missing dictionary**: if a compressed value references a dictID for which no AUX entry was emitted, the RDB is rejected as corrupt regardless of the `compression-enabled` setting. (Q3)
+- **R2.6.2** **RDB load when `master ∈ {compression, off}`**: loader reads the dictionary bytes from AUX entries and uses them to construct `ZSTD_CDict`/`ZSTD_DDict` handles (via `ZSTD_createCDict`/`ZSTD_createDDict`; no retraining), inserts them into the registry, decompresses values on the fly only if needed (frames reference their dictID so they stay compressed in memory). With `master=off` the loaded frames stay compressed but are read-only-decompress (no new compressions, no sweeper drain); operator can flip master to `compression` later to resume productive operation, or to `decompression` to start draining. (Q3, Q12)
+- **R2.6.3** **RDB load when `master == decompression`**: loader reads the dictionary bytes from AUX entries and constructs only the `ZSTD_DDict` handles needed (no retraining), decompresses every `RDB_ENC_COMPRESSED`-marked value inline, stores uncompressed, discards DDicts after load. This is the canonical "load-and-drain" path — useful for migrations or for loading an RDB on a server that should not maintain the compressed state. (Q3)
+- **R2.6.4** **Missing dictionary**: if a compressed value references a dictID for which no AUX entry was emitted, the RDB is rejected as corrupt regardless of the `compression-master-switch` setting. (Q3)
 - **R2.6.5** **AOF**: always uncompressed RESP. Writer routes every `robj` through `objectGetUncompressedView` before emitting. (Q12)
 - **R2.6.6** **Replication feed**: always uncompressed RESP. `feedReplicationBufferWithObject` routes through `objectGetUncompressedView`. Cross-version replication unaffected. (Q12)
 - **R2.6.7** **`DUMP` / `RESTORE` / `MIGRATE`**: v1 decompresses before emitting the RDB chunk. Compressed-in-place migration is v2. (Q12)
-- **R2.6.8** **Full-sync replication RDB** (primary → replica during `SYNC`/`PSYNC` full resync): emitted **uncompressed** regardless of `compression-enabled` state on the primary. When the RDB writer is invoked with a replication sink, every compressed value is routed through `objectGetUncompressedView` before serialization — same helper used by `feedReplicationBufferWithObject`. Disk RDB (local save / `BGSAVE` target) continues to use the `RDB_ENC_COMPRESSED` path from R2.6.1. This keeps cross-version replication working without replica-side awareness and preserves the "wire stays uncompressed RESP/RDB, disk may be compressed" property. Opt-in compressed full-sync (via `REPLCONF` negotiation) is a v2 extension point. (Q12)
+- **R2.6.8** **Full-sync replication RDB** (primary → replica during `SYNC`/`PSYNC` full resync): emitted **uncompressed** regardless of `compression-master-switch` state on the primary. When the RDB writer is invoked with a replication sink, every compressed value is routed through `objectGetUncompressedView` before serialization — same helper used by `feedReplicationBufferWithObject`. Disk RDB (local save / `BGSAVE` target) continues to use the `RDB_ENC_COMPRESSED` path from R2.6.1. This keeps cross-version replication working without replica-side awareness and preserves the "wire stays uncompressed RESP/RDB, disk may be compressed" property. Opt-in compressed full-sync (via `REPLCONF` negotiation) is a v2 extension point. (Q12)
 
 ### 2.7 Introspection surfaces
 
@@ -254,7 +310,7 @@ This is a deliberate simplification over an earlier design (PR #10) which propos
 ### 2.10 Observability
 
 - **R2.10.1** New `INFO compression` section with the following fields (see §5.6):
-  `compression_enabled`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_sweep_pacing_sleeps_total`, `compression_outbox_backpressure_total`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. (Q10)
+  `compression_master_switch`, `compression_active_sweeper`, `compression_active_sweeper_interval`, `compression_active_sweeper_state`, `compression_state`, `compression_active_dict_id`, `compression_dict_age_seconds`, `compression_known_dicts`, `compression_dict_cap_reached`, `compression_compressed_objects`, `compression_total_uncompressed_bytes`, `compression_total_compressed_bytes`, `compression_ratio`, `compression_live_ratio_10m`, `compression_net_saved_bytes`, `compression_candidates_pending`, `compression_candidates_dropped_total`, `compression_sweep_backpressure_total`, `compression_sweep_pacing_sleeps_total`, `compression_outbox_backpressure_total`, `compression_compressions_per_sec`, `compression_decompressions_per_sec`, `compression_skipped_incompressible`, `compression_training_last_duration_ms`, `compression_training_last_sample_count`, `compression_errors_total`. The `compression_master_switch` reports `compression` / `decompression` / `off` per R2.1.1. The `compression_active_sweeper` reports `enabled` / `disabled` per R2.1.2. The `compression_active_sweeper_state` reports `idle` / `scanning` / `sleeping` / `disabled` to make the runtime engine state visible separately from the configured switch. (Q10)
 - **R2.10.2** Latency-monitor events `compress-sync`, `decompress-sync`, `compression-train` use the existing `latency-monitor-threshold` floor. No new config. (Q10)
 - **R2.10.3** **No keyspace notifications** for compression events. Operator audit trail is provided by server log entries at `LL_NOTICE` (normal transitions) and `LL_WARNING` (training failures, cap reached). (Q10)
 - **R2.10.4** **Queue back-pressure observability contract.** The worker pool is fed by a single shared bounded queue (§4.6), so "compression is not keeping up" has several distinct root causes and each one has a different remediation. The `INFO compression` section exposes four counters plus one gauge so operators can disambiguate without reading logs:
@@ -287,20 +343,22 @@ All configs below are `MODIFIABLE_CONFIG` and persist via `CONFIG REWRITE`. Conf
 
 All configs remain in code and in `CONFIG GET *` / `CONFIG SET`; the split is documentation-only, not a hiding mechanism.
 
-#### Primary knobs (5)
+#### Primary knobs (6)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
-| `compression-enabled` | bool | `no` | master switch |
-| `compression-threads` | int | `1` | worker pool size (0..16; 0 = disabled) |
+| `compression-master-switch` | enum | `off` | master switch (R2.1.1). `compression` / `decompression` / `off`. |
+| `compression-active-sweeper` | enum | `disabled` | automatic background sweeper (R2.1.2). `enabled` / `disabled`. |
+| `compression-threads` | int | `1` | worker pool size (0..16; 0 = disabled). Only relevant in `master=compression` mode (R2.1.6). |
 | `compression-min-value-size` | bytes | `256` | lower size bound for eligibility |
 | `compression-max-value-size` | bytes | `131072` | upper size bound (0 = unbounded; default 128 KiB bounds worst-case sync decompression latency) |
 | `compression-dict-size` | bytes | `102400` | zstd trainer target dict size |
 
-#### Advanced knobs (11)
+#### Advanced knobs (12)
 
 | Name | Type | Default | Scope |
 |---|---|---|---|
+| `compression-active-sweeper-interval` | seconds | `0` | re-run interval after a sweeper pass completes (R2.1.3). `0` = no periodic re-runs (single pass on master-switch direction change, then idle). |
 | `compression-sweep-max-cpu-pct` | int | `25` | sweep pacing (1..100) |
 | `compression_cpulist` | string | `""` | CPU pinning |
 | `compression-min-savings-ratio` | percent | `10` | post-compression net-savings guard |
@@ -536,7 +594,7 @@ The registry uses a grace-period reclamation model inspired by the Linux kernel'
 
 6. **Grace barriers (wake-all via cond_broadcast):** If a worker is idle (blocked on the SPMC inbox cond var waiting for work), it may never advance its generation. The main thread forces progress by issuing a wake-all on the inbox (see §4.6 "wake-all primitive"). Every blocked consumer wakes simultaneously via `pthread_cond_broadcast`, advances its generation if a barrier signal is set, then either resumes consuming or re-blocks. Enqueueing barrier jobs into the SPMC inbox is *not* sufficient under work-stealing semantics — a single worker could drain all barriers while siblings stay asleep on the cond var.
 
-7. **Bounding retiring dicts (cap interaction with R2.3.3):** Retiring dicts remain in `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, or run `COMPRESSION SWEEP` to force-rewrite frames referencing the oldest retiring dict so it can drain). No separate retiring list is maintained — GC scans `dicts[]` directly (max 16 entries).
+7. **Bounding retiring dicts (cap interaction with R2.3.3):** Retiring dicts remain in `dicts[]`, which is capped at `compression-dict-max-versions` (R2.3.3, default 4). Each retiring dict occupies a slot until step 5 reclaims it. Under normal load the grace-barrier mechanism (step 6) keeps reclamation latency bounded and the cap is not hit. If draining cannot keep up — e.g. workers are starved, or `frame_refs` stays > 0 on retiring dicts because old frames are not being rewritten/expired — the cap is reached and **both training and promotion are refused** per R2.3.3: a `LL_WARNING` log entry is emitted, `compression_dict_cap_reached` is set to `1` in `INFO`, and the operator must intervene (raise the cap, set `compression-master-switch decompression + compression-active-sweeper enabled` to drain compressed frames, or `COMPRESSION DICT DROP <dictID>` to force-retire a specific dict). No separate retiring list is maintained — GC scans `dicts[]` directly (max 16 entries).
 
 **Why QSBR over per-job refcounting:**
 
@@ -560,16 +618,16 @@ The QSBR approach was chosen because:
 
 | Subcommand | Summary | ACL |
 |---|---|---|
-| `COMPRESSION ENABLE` | Set `compression-enabled yes`; log `LL_NOTICE`. | `@admin` |
-| `COMPRESSION DISABLE` | Set `compression-enabled no`; log `LL_NOTICE`. | `@admin` |
 | `COMPRESSION TRAIN` | Submit an immediate `BIO_COMPRESSION_TRAIN` job. | `@admin` |
-| `COMPRESSION SWEEP [direction=compress|decompress]` | Trigger a full-keyspace sweep. | `@admin` |
+| `COMPRESSION SWEEP FORCE` | Trigger a one-shot keyspace pass (R2.1.4). Uses the master switch's current direction. Allowed regardless of `compression-active-sweeper`; rejected if `master=off`. | `@admin` |
 | `COMPRESSION STATUS` | Returns the `INFO compression` section as a flat structured reply. | `@read` |
 | `COMPRESSION DICT LIST` | Returns an array per registry entry: `{dictID, state, age_ms, refcount, bytes_len}`. | `@admin` |
 | `COMPRESSION DICT EXPORT <dictID>` | Returns base64-encoded dictionary bytes. | `@admin` |
 | `COMPRESSION DICT IMPORT <base64-bytes>` | Installs as a new dict; atomic promotion. | `@admin` |
 | `COMPRESSION DICT DROP <dictID>` | Force-retires a dict. Fails if `refcount > 0`. | `@admin` |
 | `COMPRESSION HELP` | Subcommand listing. | `@read` |
+
+Master-switch state changes are made via `CONFIG SET compression-master-switch compression|decompression|off`. The legacy convenience aliases `COMPRESSION ENABLE` / `COMPRESSION DISABLE` are not part of the v1 surface — the 3-state enum doesn't map cleanly to "enable"/"disable" verbs (enable to which state?), so operators use `CONFIG SET` directly. This matches the precedent of every other tri-state Valkey config (`maxmemory-policy`, `appendfsync`).
 
 Each subcommand has a JSON file under `src/commands/compression-*.json` with arity, flags, reply schema. `utils/generate-command-code.py` regenerates `src/commands.def`.
 
@@ -589,7 +647,7 @@ Reuse the existing queue primitives from `src/queues.h`:
 |---|---|---|
 | Write-path hook (`dbAdd`/`dbOverwrite`/`dbSetValue`) | Drop the candidate; the sweeper will re-discover the key on its next tick. | `compression_candidates_dropped_total` |
 | Background sweeper | Pause iteration at the current shard cursor and return from the tick; resume from the same cursor next tick. Distinct from CPU-pacing sleeps. | `compression_sweep_backpressure_total` |
-| Manual `COMPRESSION SWEEP` | Same as background sweeper — pause at cursor, resume when inbox has room. An explicit operator command should eventually make progress, not silently drop. | `compression_sweep_backpressure_total` |
+| Manual `COMPRESSION SWEEP FORCE` | Same as background sweeper — pause at cursor, resume when inbox has room. An explicit operator command should eventually make progress, not silently drop. | `compression_sweep_backpressure_total` |
 | Multi-key compression fan-out (future) | Drop; the main compression path will re-enqueue the affected keys on subsequent writes or sweep ticks. | `compression_candidates_dropped_total` |
 
 The outbox side has its own back-pressure: if a worker has a result to post but the MPSC outbox is full (main thread has not drained `compressionAfterSleep` often enough), the worker retries rather than drops — discarding a completed compression would waste CPU work already done. Retries are observed via `compression_outbox_backpressure_total`. Steady-state outbox saturation indicates a main-loop problem rather than a compression-feature problem, but surfacing the counter keeps the diagnostic honest.
@@ -829,7 +887,8 @@ Two tiers, per Q15.
 A new `--compression` flag on each Tcl test driver starts the server under test with an aggressive compression config that forces every eligible value through the compression path:
 
 ```
---compression-enabled yes
+--compression-master-switch compression
+--compression-active-sweeper enabled
 --compression-min-value-size 0
 --compression-max-value-size 0            # no upper bound
 --compression-lfu-threshold 255
@@ -856,7 +915,7 @@ Deliverables:
 - `tests/unit/compression-dict.tcl` — `COMPRESSION TRAIN`, `DICT LIST/EXPORT/IMPORT/DROP`, drift detection, dict-version cap.
 - `tests/unit/compression-multi.tcl` — Q11 invariants (`WATCH` + background compression → `EXEC` does not abort; `CLIENT TRACKING` → no spurious invalidations; `EVAL` / `EXEC` semantics).
 - `tests/unit/compression-cow-invariant.tcl` — **merge-blocker**: for every mutating string command (`APPEND`, `SETRANGE`, `SET` overwrite, `GETSET`, `GETDEL`, `SETBIT`, `BITOP` write, `BITFIELD` write) and for module write-DMA, verify that enqueueing a compression job then issuing the mutation leaves the original bytes intact for the worker and produces a correct compressed frame for the post-mutation state. Fails loud if any code path mutates in place while `refcount > 1`. Implements the R2.4.5 audit via a runtime test rather than a static audit, so it protects against future drift.
-- `tests/unit/compression-persistence.tcl` — RDB save/load with active+retiring dicts; load with `compression-enabled no`; missing dict AUX rejection; AOF stays uncompressed; cross-version replication.
+- `tests/unit/compression-persistence.tcl` — RDB save/load with active+retiring dicts; load with `compression-master-switch decompression`; missing dict AUX rejection; AOF stays uncompressed; cross-version replication.
 - `tests/integration/compression-replication.tcl` — primary compresses, replica does not; toggle on primary does not disrupt stream.
 - `tests/unit/cluster/compression-migrate.tcl` — `MIGRATE` decompresses on source.
 - `tests/unit/compression-transparency.tcl` — canary meta-test for a handful of commands.
@@ -876,7 +935,7 @@ Deliverables:
 
 One scenario added to the existing benchmark workflows:
 - Workload: 80/20 GET/SET, 1 KiB values, warm cache.
-- Compared: `compression-enabled no` vs. `yes` (default production config).
+- Compared: `compression-master-switch off` vs. `compression` (default production config).
 - Expected: ~30% lower `used_memory`; ≤20% TPS degradation.
 - Status: **informational**, not a merge gate.
 
@@ -908,7 +967,7 @@ The §7.3 primitive scenario (uniform keys, fixed 1 KiB values) validates a lowe
 | `sort-heavy` | `SORT` of a 1000-element list where every element is a compressed value. Stresses main-thread blocking in list/set operations. |
 | `mixed-pipeline` | Pipelined GET/SET/APPEND with 20% writes on `zipf-0.99` keys. Exercises the COW invariant from R2.4.4 under realistic load. |
 
-A `tests/compression/benchmarks/run.sh` driver runs each scenario under both `compression-enabled no` and `yes`, produces a comparison report (P50, P99, P999 latency per command type; `used_memory`; `compression_ratio` from `INFO compression`), and commits a reference JSON of accepted numbers into the repo. Future changes that regress beyond a per-metric threshold are flagged for reviewer attention but remain **informational**, consistent with §7.3 policy — not a merge gate.
+A `tests/compression/benchmarks/run.sh` driver runs each scenario under both `compression-master-switch off` and `compression`, produces a comparison report (P50, P99, P999 latency per command type; `used_memory`; `compression_ratio` from `INFO compression`), and commits a reference JSON of accepted numbers into the repo. Future changes that regress beyond a per-metric threshold are flagged for reviewer attention but remain **informational**, consistent with §7.3 policy — not a merge gate.
 
 CI runs only `baseline-uniform-1k` on every PR (cheap, seconds). The full suite runs nightly / on release candidates.
 
