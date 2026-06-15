@@ -514,12 +514,12 @@ typedef enum {
 #define COMPRESSION_MASTER_COMPRESSION 1
 #define COMPRESSION_MASTER_DECOMPRESSION 2
 
-/* Compression active-sweeper values (compression-active-sweeper config — R2.1.2).
+/* Compression active-sweeper values (compression-automatic-sweeper config — R2.1.2).
  * Independent of the master switch: enables/disables the cron-driven
  * background convergence engine. The sweeper takes its direction from
  * the current master switch on every iteration. */
-#define COMPRESSION_ACTIVE_SWEEPER_DISABLED 0
-#define COMPRESSION_ACTIVE_SWEEPER_ENABLED 1
+#define COMPRESSION_AUTOMATIC_SWEEPER_DISABLED 0
+#define COMPRESSION_AUTOMATIC_SWEEPER_ENABLED 1
 
 /* Replication diskless load defines */
 #define REPL_DISKLESS_LOAD_DISABLED 0
@@ -2416,17 +2416,17 @@ struct valkeyServer {
      * ==========================================================
      */
     /* Primary (§2.12 — 6 knobs) */
-    int compression_master_switch;           /* Master switch (R2.1.1). One of COMPRESSION_MASTER_OFF /
-                                                _COMPRESSION / _DECOMPRESSION. Default: OFF. */
-    int compression_active_sweeper;          /* Sweeper switch (R2.1.2). One of COMPRESSION_ACTIVE_SWEEPER_DISABLED /
+    int compression_master_switch;              /* Master switch (R2.1.1). One of COMPRESSION_MASTER_OFF /
+                                                   _COMPRESSION / _DECOMPRESSION. Default: OFF. */
+    int compression_automatic_sweeper;          /* Sweeper switch (R2.1.2). One of COMPRESSION_AUTOMATIC_SWEEPER_DISABLED /
                                                 _ENABLED. Default: DISABLED. */
-    int compression_active_sweeper_interval; /* Re-run interval after a sweeper pass completes (R2.1.3),
+    int compression_automatic_sweeper_interval; /* Re-run interval after a sweeper pass completes (R2.1.3),
                                                 in seconds. Default: 0 (single pass on direction change,
                                                 no periodic re-runs). */
-    int compression_threads;                 /* Worker pool size (0..16). Default: 1. */
-    size_t compression_min_value_size;       /* Lower size bound for eligibility. Default: 256. */
-    size_t compression_max_value_size;       /* Upper size bound (0 = unbounded). Default: 131072. */
-    size_t compression_dict_size;            /* ZSTD trainer target dict size. Default: 102400. */
+    int compression_threads;                    /* Worker pool size (0..16). Default: 1. */
+    size_t compression_min_value_size;          /* Lower size bound for eligibility. Default: 256. */
+    size_t compression_max_value_size;          /* Upper size bound (0 = unbounded). Default: 131072. */
+    size_t compression_dict_size;               /* ZSTD trainer target dict size. Default: 102400. */
     /* Advanced (§2.12 — 11 knobs) */
     int compression_sweep_max_cpu_pct;       /* Sweep pacing (1..100). Default: 25. */
     char *compression_cpulist;               /* CPU affinity list for workers. Default: "". */

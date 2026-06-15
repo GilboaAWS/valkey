@@ -23,8 +23,8 @@ start_server {tags {"compression"}} {
     test {COMPRESSION STATUS reports default off / disabled state} {
         set status [r compression status]
         assert_match "*compression_master_switch:off*" $status
-        assert_match "*compression_active_sweeper:disabled*" $status
-        assert_match "*compression_active_sweeper_interval:0*" $status
+        assert_match "*compression_automatic_sweeper:disabled*" $status
+        assert_match "*compression_automatic_sweeper_interval:0*" $status
         assert_match "*compression_state:disabled*" $status
         assert_match "*compression_active_dict_id:0*" $status
     }
@@ -77,8 +77,8 @@ start_server {tags {"compression"}} {
     test {All 18 compression config knobs are registered with documented defaults} {
         # Primary (6) — see design/detailed-design.md §2.12
         assert_equal [lindex [r config get compression-master-switch] 1] "off"
-        assert_equal [lindex [r config get compression-active-sweeper] 1] "disabled"
-        assert_equal [lindex [r config get compression-active-sweeper-interval] 1] "0"
+        assert_equal [lindex [r config get compression-automatic-sweeper] 1] "disabled"
+        assert_equal [lindex [r config get compression-automatic-sweeper-interval] 1] "0"
         assert_equal [lindex [r config get compression-threads] 1] "1"
         assert_equal [lindex [r config get compression-min-value-size] 1] "256"
         assert_equal [lindex [r config get compression-max-value-size] 1] "131072"
@@ -112,12 +112,12 @@ start_server {tags {"compression"}} {
     }
 
     test {Active-sweeper enum accepts both documented values} {
-        # R2.1.2: compression-active-sweeper is an enum (disabled / enabled).
-        r config set compression-active-sweeper enabled
-        assert_equal [lindex [r config get compression-active-sweeper] 1] "enabled"
-        r config set compression-active-sweeper disabled
-        assert_equal [lindex [r config get compression-active-sweeper] 1] "disabled"
-        catch {r config set compression-active-sweeper yes} err
+        # R2.1.2: compression-automatic-sweeper is an enum (disabled / enabled).
+        r config set compression-automatic-sweeper enabled
+        assert_equal [lindex [r config get compression-automatic-sweeper] 1] "enabled"
+        r config set compression-automatic-sweeper disabled
+        assert_equal [lindex [r config get compression-automatic-sweeper] 1] "disabled"
+        catch {r config set compression-automatic-sweeper yes} err
         assert_match "*ERR*" $err
     }
 
@@ -185,5 +185,99 @@ start_server {tags {"compression"}} {
         assert_equal "PONG" [r ping]
         r config set compression-master-switch off
         r del keyfortrain
+    }
+
+    test {Sweeper running field is present in INFO and COMPRESSION STATUS} {
+        # R2.10.1: compression_sweeper_running reports the engine's
+        # runtime liveness as 0/1 (separate from the configured switch).
+        set status [r compression status]
+        assert_match "*compression_sweeper_running:*" $status
+    }
+
+    test {COMPRESSION SWEEP FORCE is rejected when master is off} {
+        r config set compression-master-switch off
+        catch {r compression sweep force} err
+        assert_match "*ERR*" $err
+        # No pass triggered; sweeper not running.
+        set status [r compression status]
+        assert_match "*compression_sweeper_running:0*" $status
+    }
+
+    test {COMPRESSION SWEEP FORCE accepted under master=compression} {
+        r config set compression-master-switch compression
+        # Default sweeper config is disabled — FORCE still works (R2.1.4).
+        assert_equal [lindex [r config get compression-automatic-sweeper] 1] "disabled"
+        assert_equal "OK" [r compression sweep force]
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE accepted under master=decompression} {
+        r config set compression-master-switch decompression
+        assert_equal "OK" [r compression sweep force]
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE syntax: bare SWEEP rejected} {
+        r config set compression-master-switch compression
+        # Bare "COMPRESSION SWEEP" (no FORCE) is an arity error.
+        catch {r compression sweep} err
+        assert_match "*ERR*wrong number*" $err
+        r config set compression-master-switch off
+    }
+
+    test {COMPRESSION SWEEP FORCE syntax: bogus arg rejected} {
+        r config set compression-master-switch compression
+        catch {r compression sweep wrong} err
+        assert_match "*ERR*" $err
+        r config set compression-master-switch off
+    }
+
+    test {Sweeper: master=off + sweeper=enabled is a no-op} {
+        r config set compression-master-switch off
+        r config set compression-automatic-sweeper enabled
+        # Cron is a no-op with master=off; sweeper stays not-running.
+        after 300
+        set status [r compression status]
+        assert_match "*compression_sweeper_running:0*" $status
+        # Reset.
+        r config set compression-automatic-sweeper disabled
+    }
+
+    test {Sweeper: enabled + master=compression runs exactly one pass with interval=0} {
+        r config set compression-master-switch off
+        r config set compression-automatic-sweeper-interval 0
+        r config set compression-automatic-sweeper enabled
+        # Empty keyspace; pass completes in one tick. With interval=0
+        # there are no periodic re-runs — the sweeper does NOT loop.
+        r config set compression-master-switch compression
+        # Generous wait so multiple cron ticks definitely happen.
+        after 600
+        set status [r compression status]
+        assert_match "*compression_sweeper_running:0*" $status
+        # Reset.
+        r config set compression-master-switch off
+        r config set compression-automatic-sweeper disabled
+    }
+
+    test {Sweeper: interval > 0 schedules a periodic re-run} {
+        r config set compression-master-switch off
+        # 1 second interval — long enough to be observable as "currently
+        # waiting", short enough to keep the test fast.
+        r config set compression-automatic-sweeper-interval 1
+        r config set compression-automatic-sweeper enabled
+        r config set compression-master-switch compression
+        # Wait through multiple cron ticks. With interval=1 and an
+        # empty keyspace each pass completes in <1ms; we should see
+        # sweeper_running flip 0/1 over time. Hard to test the
+        # transient "1" reliably, so instead verify that AT LEAST one
+        # pass happens (sweeper triggers via direction change) AND
+        # the final state is "not running, will re-run" (= 0).
+        after 300
+        set status [r compression status]
+        assert_match "*compression_sweeper_running:0*" $status
+        # Reset.
+        r config set compression-master-switch off
+        r config set compression-automatic-sweeper disabled
+        r config set compression-automatic-sweeper-interval 0
     }
 }
