@@ -204,10 +204,9 @@ Every subcommand calls into S2 public API; S4 owns reply schema, command JSON, a
 - [ ] **S4.2 — `COMPRESSION` command tree full implementation**: `STATUS`, `DICT LIST`, `DICT DROP`, `SWEEP`, `DEBUG`. Reply-schema tests per §7.4.
 - [ ] **S4.3 — Latency monitor events** per R2.10 (train start/finish, worker stall, etc.)
 - [ ] **S7.2 — CI — long-running perf regression**: nightly job running §7.3 under AddressSanitizer + ThreadSanitizer.
-- [ ] **S3.1 — RDB encode path**: new `RDB_ENC_COMPRESSED` marker, varint-encoded alg_magic/alg_meta/sizes, AUX entries for dictionaries (ZSTD). Implements R2.6.1–R2.6.4.
-- [ ] **S3.2 — RDB decode path**: lookup dict by id, rehydrate `OBJ_ENCODING_COMPRESSED` robj. Unknown-dict error path per R2.6.5.
-- [ ] **S3.3 — Full-sync RDB uncompressed flag**: implements R2.6.8 (new this walkthrough) — full-sync RDB always emits uncompressed regardless of `compression-master-switch` state. Disk RDB still compressed.
-- [ ] **S3.4 — AOF**: compressed values serialized as their uncompressed command forms (`SET key value`). R2.7.
+- [x] **S3.4 — AOF uncompressed (v1)**: AOF on-disk format stays uncompressed RESP. This is unconditional and version-independent — AOF is never compressed in this design. Two AOF write paths exist; only the second can meet a compressed value: (1) **command propagation** (`feedAppendOnlyFile`) writes the command from `argv` at execution time ("on arrival"), before the sweeper ever runs, so it never sees compression; (2) **AOF rewrite** (`BGREWRITEAOF` / auto-rewrite) regenerates the file from the live keyspace and reads *stored* values, which the sweeper may have compressed since arrival — the rewrite helpers (`rioWriteBulkObject`, and `rdbSaveStringObject` when the RDB preamble is enabled) decompress every compressed value before emit (R2.6.5). **Covered by PR #24.**
+- [~] **S3.1 / S3.2 — Compressed on-disk RDB (encode + decode) → deferred to v2.** `RDB_ENC_COMPRESSED` on-disk encoding + AUX dict entries + decode (R2.6.1–R2.6.4). This is a *local-snapshot optimization* (smaller/faster RDB file, faster warm-up back to the compressed state after a restart) — **not** a correctness requirement and **not** a sync-speed improvement (full-sync is uncompressed in v1 regardless, R2.6.8). v1 is correct without it: disk RDB stores uncompressed and the sweeper re-compresses after load. In v1 the `RDB_ENC_COMPRESSED` (=4) encoding byte stays reserved-but-unused and `RDB_VERSION` is **not** bumped. See §8. *(deferral decision 2026-06-24, @GilboaAWS lead)*
+  - **Note — what was "S3.3" (full-sync uncompressed flag):** dropped as a standalone task. The flag that forces the wire uncompressed only has meaning once the disk RDB can be compressed (i.e., in v2). At that point, per-target selection — disk save (compressed) vs. a `REPLCONF compression yes`-negotiated replica (compressed sync) vs. a legacy replica (uncompressed) — is just an implementation detail of the v2 compressed-RDB + `REPLCONF` feature, not a separate deliverable. In v1 there is nothing to do: every target saves uncompressed already (PR #24), so full-sync is uncompressed by construction.
 
 **End of Phase 1 gate:**
 - Feature works end-to-end on a single replica set with `compression-master-switch compression` + `compression-automatic-sweeper enabled` + manual dict training.
@@ -291,6 +290,7 @@ Total calendar: ~11 weeks assuming no significant delays. Series work was estima
 From §1.4 (non-goals) and the walkthrough decisions — do **not** implement in this plan:
 
 - Wire-level compression negotiation (`REPLCONF compression yes`) — deferred to v2 (Threads #2, #31)
+- Compressed on-disk RDB (`RDB_ENC_COMPRESSED` encode/decode — S3.1/S3.2) — deferred to v2 (decision 2026-06-24). A local-snapshot-only optimization (smaller/faster RDB, faster post-restart warm-up); v1 saves uncompressed and the sweeper re-compresses after load. No correctness or sync-speed impact. `RDB_ENC_COMPRESSED`=4 stays reserved-but-unused; `RDB_VERSION` not bumped in v1.
 - IO threads for decompression — rejected in v1 per Appendix §C.7 (Thread #25)
 - Async decompression path for long reads — v2 opt-in (Thread #26 context)
 - LIST/HASH/ZSET per-element compression — v1 is STRING-only (§1.4)
